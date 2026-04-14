@@ -1,0 +1,26 @@
+
+
+##### todo flow to better
+##### todo train the flow model from sub-optimal action under state to better action
+####  todo  normal flow direction, where the action direction is determinated by random sampling
+python3 flow_main.py --debug_mode False --wandb_log True --time_scale False --beta 7.0 --energy_scale 200 --flow_guided_mode normal --critic_type ciql --load_critic_model None --current_exp_label ciql_critic
+
+
+##### todo  expectile reinforcement learning
+##### todo  train the expectile flow model
+python3 expectile_flow_main.py --debug_mode False --wandb_log True --time_scale False --beta 7.0 --energy_scale 1 --iql_tau 0.5 --expectile_func_tau 0.9 --expectile_flow_tau 0.95 --expectile_type none --flow_guided_mode normal --critic_type ciql --load_critic_model None --current_exp_label ciql_expectile
+
+
+##### todo  observation flow to better and use inverse dynamic to generate actions
+python3 obs_flow2better_main.py --debug_mode False --wandb_log True --time_scale False --beta 7.0 --energy_scale 200 --flow_guided_mode normal --critic_type ciql --load_critic_model None --current_exp_label ciql_critic
+
+
+##### todo  RL flow
+python3 multistep_rl_flow_main.py --debug_mode False --wandb_log True --time_scale False --beta 7.0 --energy_scale 100 --iql_tau 0.5 --divergence_coef 1.0 --conservative_coef 0.1 --critic_type ciql --load_critic_model ciql_rl_flow --current_exp_label ciql_rl_flow
+
+
+#####  todo dist_RL_flow
+python3 distributional_rl_flow_main.py --debug_mode False --wandb_log True --time_scale False --beta 7.0 --energy_scale 10 --iql_tau 0.5 --conservative_coef 0.1 --divergence_coef 1.0 --critic_type ciql --load_critic_model ciql_rl_flow --batch_size 1024 --current_exp_label ciql_rl_flow_test2
+
+##### todo pretrain
+python3 pretrain_value_models.py --debug_mode False --wandb_log True --iql_tau 0.5 --critic_type iql --batch_size 1024 --dataset xxxx --current_exp_label iql_rl_flow

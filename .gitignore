@@ -1,0 +1,15 @@
+.venv/
+.idea/
+.vscode/
+output/
+wandb/
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.pt
+*.pth
+*.ckpt
+.DS_Store
