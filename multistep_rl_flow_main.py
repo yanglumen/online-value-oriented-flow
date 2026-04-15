@@ -29,10 +29,20 @@ def generate_wandb_exp_name(argus, wandb_project):  # diffusion_q_function, deno
 def import_parameters(var_kwargs=None, mode="multistep_rl_flow_parameters"):
     print(colored(f"Loading {mode} parameter ......", color="green"))
     if mode == "multistep_rl_flow_parameters":
-        hyperparameters = multistep_rl_flow_parameters
+        hyperparameters = dict(multistep_rl_flow_parameters)
         hyperparameters["mode"] = "guided_flow"
+        hyperparameters.pop("adv_rl_multiple_actions", None)
     else:
         raise Exception("The mode of import_parameters is wrong !!!")
+    if var_kwargs is None:
+        var_kwargs = {}
+    removed_args = {
+        "adv_rl_multiple_actions": "adv_rl/grpo value updates now use the shared single-sample flow core; this argument is no longer read.",
+    }
+    stale_args = sorted(set(var_kwargs) & set(removed_args))
+    if stale_args:
+        details = "; ".join(f"{key}: {removed_args[key]}" for key in stale_args)
+        raise ValueError(f"Removed or unused offline argument(s): {details}")
     for key, val in base_parameters.items():
         if key not in hyperparameters.keys():
             hyperparameters[key] = val
@@ -42,11 +52,17 @@ def import_parameters(var_kwargs=None, mode="multistep_rl_flow_parameters"):
     }.items():
         if enumerate_key in var_kwargs.keys():
             var_kwargs[enumerate_key] = enumerate_var[var_kwargs[enumerate_key]]
+    unknown_args = sorted(set(var_kwargs) - set(hyperparameters))
+    if unknown_args:
+        raise ValueError(f"Unknown offline argument(s): {unknown_args}")
     if var_kwargs:
         hyperparameters.update(var_kwargs)
     return hyperparameters
 
 def hyperparameter_finetuning(argus):
+    argus.sequence_length = int(argus.sequence_length)
+    if argus.sequence_length < 1:
+        raise ValueError("Offline sequence_length must be >= 1.")
     if argus.rl_mode in [RLTrainMode.flow_constrained_rl, RLTrainMode.flow_constrained_rl2, RLTrainMode.flow_constrained_rl3,
                          RLTrainMode.flow_constrained_rl4, RLTrainMode.flow_constrained_rl5]:
         if argus.dataset == "halfcheetah-medium-expert-v2":

@@ -11,6 +11,12 @@ from models.rl_flow_forward_process import sample_weighted_interpolated_points
 from trainer.trainer_util import (
     batch_to_device,
 )
+from trainer.shared_flow_rl_core import (
+    adv_policy_update,
+    adv_value_update,
+    behavior_flow_update,
+    energy_critic_update,
+)
 from termcolor import colored
 from config.dict2class import obj2dict
 from config.multistep_rl_flow_hyperparameter import *
@@ -480,33 +486,39 @@ class guided_flow_trainer():
         return loss
 
     def energy_train(self, iql_tau, observations, actions, next_observations, rewards, dones, next_actions=None, fake_actions=None, fake_next_actions=None):
-        q_loss, v_loss, loss_info = self.energy_model.loss(
-            tau=iql_tau, behavior_model=self.behavior_flow, observations=observations, actions=actions, next_observations=next_observations,
-            next_actions=next_actions, rewards=rewards, dones=dones, fake_actions=fake_actions, fake_next_actions=fake_next_actions)
-        if v_loss is not None:
-            v_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.energy_model.v.parameters(), max_norm=10.0)
-            self.energy_v_optimizer.step()
-            self.energy_v_optimizer.zero_grad()
-        if q_loss is not None:
-            q_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.energy_model.q.parameters(), max_norm=10.0)
-            self.energy_q_optimizer.step()
-            self.energy_q_optimizer.zero_grad()
-        self.energy_model.q_ema()
-        return loss_info
+        return energy_critic_update(
+            batch={
+                "iql_tau": iql_tau,
+                "observations": observations,
+                "actions": actions,
+                "next_observations": next_observations,
+                "next_actions": next_actions,
+                "rewards": rewards,
+                "dones": dones,
+                "fake_actions": fake_actions,
+                "fake_next_actions": fake_next_actions,
+            },
+            models={
+                "energy_model": self.energy_model,
+                "behavior_flow": self.behavior_flow,
+            },
+            optimizers={
+                "energy_q_optimizer": self.energy_q_optimizer,
+                "energy_v_optimizer": getattr(self, "energy_v_optimizer", None),
+            },
+            config=self.argus,
+        )
 
     def behavior_flow_train(self, observations, actions):
-        x_t, t, dx_dt, weights = sample_weighted_interpolated_points(
-            argus=self.argus, observations=observations, actions=actions, energy=None, beta=self.argus.beta,
-            energy_model=self.energy_model, weighted_samples_type=WeightedSamplesType.linear_interpolation,
+        return behavior_flow_update(
+            batch={"observations": observations, "actions": actions},
+            models={
+                "energy_model": self.energy_model,
+                "behavior_flow": self.behavior_flow,
+            },
+            optimizers={"bf_optimizer": self.bf_optimizer},
+            config=self.argus,
         )
-        v_pred = self.behavior_flow(torch.cat([observations, x_t], dim=-1), t)
-        loss = self.loss_fn(v_pred, dx_dt)
-        self.bf_optimizer.zero_grad()
-        loss.backward()
-        self.bf_optimizer.step()
-        return {"behavior_flow_loss": loss.detach().cpu().numpy().item()}
 
     def guided_train(self, num_epochs, num_steps_per_epoch):
         try:
@@ -876,130 +888,41 @@ class guided_flow_trainer():
                     print(f"Epoch {epoch} | BestScore {self.best_model_info['performance']} | Step {self.step} | Loss: {loss}")
                 self.step += 1
 
-    def adv_based_value_train(self, observations, actions, next_observations, next_actions, multiple_actions=20):
-        x_t, t, dx_dt, _ = sample_weighted_interpolated_points(
-            argus=self.argus, observations=observations, actions=actions, energy=None, beta=self.argus.beta,
-            energy_model=self.energy_model, weighted_samples_type=WeightedSamplesType.linear_interpolation,
-            clip_value=self.argus.x_t_clip_value,
+    def adv_based_value_train(self, observations, actions):
+        return adv_value_update(
+            batch={
+                "observations": observations,
+                "actions": actions,
+            },
+            models={
+                "energy_model": self.energy_model,
+                "flow_energy_model": self.flow_energy_model,
+            },
+            optimizers={
+                "fv_optimizer": self.fv_optimizer,
+                "fv_v_optimizer": self.fv_v_optimizer,
+            },
+            config=self.argus,
         )
-        # noise_x_t = (x_t + torch.randn_like(x_t)).clip(-self.argus.x_t_clip_value, self.argus.x_t_clip_value)
-        # noise_dxdt = (dx_dt + torch.randn_like(dx_dt)).clip(-self.argus.x_t_clip_value, self.argus.x_t_clip_value)
-        Q = self.flow_energy_model.q(x=torch.cat([observations, x_t, dx_dt], dim=-1), t=t)
-        # conservative_q_loss = torch.logsumexp(
-        #     self.flow_energy_model.q(x=torch.cat([observations, noise_x_t, noise_dxdt], dim=-1), t=t), dim=0) - Q.mean()
-        normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True)
-        # normed_noise_dxdt = noise_dxdt / torch.norm(noise_dxdt, dim=-1, keepdim=True)
-        V = self.flow_energy_model.v(x=torch.cat([observations, x_t, normed_dx_dt], dim=-1), t=t)
-        # conservative_v_loss = torch.logsumexp(
-        #     self.flow_energy_model.v(x=torch.cat([observations, noise_x_t, normed_dx_dt], dim=-1), t=t), dim=0) - V.mean()
-        with torch.no_grad():
-            target_fv = self.energy_model.get_scaled_q(obs=observations, act=actions, scale=self.argus.energy_scale)
-            # target_fv = self.energy_model.get_scaled_min_qs(obs=observations, act=actions, scale=self.argus.energy_scale)
-        Q_loss = self.loss_fn(Q, target_fv.detach())  # + self.argus.conservative_coef * conservative_q_loss.mean()
-        V_loss = self.loss_fn(V, target_fv.detach())  # + self.argus.conservative_coef * conservative_v_loss.mean()
-        self.fv_optimizer.zero_grad()
-        Q_loss.backward()
-        self.fv_optimizer.step()
-        self.fv_v_optimizer.zero_grad()
-        V_loss.backward()
-        self.fv_v_optimizer.step()
-        self.ema.update_model_average(self.flow_energy_model.q_target, self.flow_energy_model.q)
-        return {
-            # "value_divergence": total_divergence.mean().detach().cpu().numpy().item(),
-            "flow_value_loss": Q_loss.detach().cpu().numpy().item(),
-            "flow_v_value_loss": V_loss.detach().cpu().numpy().item(),
-            "flow_value": Q.mean().detach().cpu().numpy().item(),
-            "flow_v_value": V.mean().detach().cpu().numpy().item(),
-        }
-        # num_samples = len(observations)
-        # t_tensor = torch.randn(num_samples, multiple_actions, 1, device=self.argus.device, dtype=torch.float32)
-        # x_1 = actions.unsqueeze(dim=1).repeat(1, multiple_actions, 1)
-        # x_0 = torch.randn_like(x_1, device=actions.device)
-        # x_0 = torch.clip(x_0, -self.argus.x_t_clip_value, self.argus.x_t_clip_value)
-        # x_t = (1 - t_tensor) * x_0 + t_tensor * x_1
-        # dx_dt = x_1 - x_0
-        # Q = self.flow_energy_model.q(x=torch.cat([observations.unsqueeze(dim=1).repeat(1, multiple_actions, 1), x_t, dx_dt], dim=-1), t=t_tensor)
-        # with torch.no_grad():
-        #     target_Q = self.energy_model.get_scaled_q(obs=observations, act=actions, scale=self.argus.energy_scale)
-        # Q_loss = self.loss_fn(Q, target_Q.unsqueeze(1).repeat(1, multiple_actions, 1).detach())
-        # normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True)
-        # V = self.flow_energy_model.v(x=torch.cat([observations.unsqueeze(dim=1).repeat(1, multiple_actions, 1), x_t, normed_dx_dt], dim=-1), t=t_tensor)
-        # V_loss = self.loss_fn(V, target_Q.unsqueeze(1).repeat(1, multiple_actions, 1).detach())
-        #
-        # self.fv_optimizer.zero_grad()
-        # Q_loss.backward()
-        # self.fv_optimizer.step()
-        # self.fv_v_optimizer.zero_grad()
-        # V_loss.backward()
-        # self.fv_v_optimizer.step()
-        # self.ema.update_model_average(self.flow_energy_model.q_target, self.flow_energy_model.q)
-        # return {
-        #     # "value_divergence": total_divergence.mean().detach().cpu().numpy().item(),
-        #     "flow_value_loss": Q_loss.detach().cpu().numpy().item(),
-        #     "flow_v_value_loss": V_loss.detach().cpu().numpy().item(),
-        #     "flow_value": Q.mean().detach().cpu().numpy().item(),
-        #     "flow_v_value": V.mean().detach().cpu().numpy().item(),
-        # }
 
-    def adv_based_policy_train(self, observations, actions, next_observations, next_actions):
-        x_t, t, dx_dt, weights = sample_weighted_interpolated_points(
-            argus=self.argus, observations=observations, actions=actions, energy=None, beta=self.argus.beta,
-            energy_model=self.energy_model, weighted_samples_type=WeightedSamplesType.linear_interpolation,
-            clip_value=self.argus.x_t_clip_value,
+    def adv_based_policy_train(self, observations, actions):
+        return adv_policy_update(
+            batch={
+                "observations": observations,
+                "actions": actions,
+            },
+            models={
+                "flow_model": self.model,
+                "target_flow_model": self.target_model,
+                "energy_model": self.energy_model,
+                "flow_energy_model": self.flow_energy_model,
+            },
+            optimizers={
+                "flow_optimizer": self.optimizer,
+                "fv_optimizer": self.fv_optimizer,
+            },
+            config=self.argus,
         )
-        pred_u = self.model(x=torch.cat([observations, x_t], dim=-1), t=t)
-        # with torch.no_grad():
-        #     behavior_u = self.behavior_flow(x=torch.cat([observations, x_t], dim=-1), t=t)
-        pred_u = pred_u.clamp(-self.argus.x_t_clip_value, self.argus.x_t_clip_value)
-        # divergence = torch.norm(pred_u - dx_dt, dim=-1, keepdim=True)
-        divergence = self.loss_fn(pred_u, dx_dt)
-        normed_pred_u = pred_u / torch.norm(pred_u, dim=-1, keepdim=True)
-        pred_Q = self.flow_energy_model.q(x=torch.cat([observations, x_t, pred_u], dim=-1), t=t)
-        pred_V = self.flow_energy_model.v(x=torch.cat([observations, x_t, normed_pred_u], dim=-1), t=t)
-        # loss = self.argus.divergence_coef * divergence + pred_V - pred_Q
-        loss = pred_V.detach() - pred_Q
-
-        loss = self.argus.divergence_coef * divergence + loss.mean()
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self.fv_optimizer.zero_grad()
-        self.ema.update_model_average(self.target_model, self.model)
-        return {
-            "flow_divergence_coef": self.argus.divergence_coef,
-            "flow_divergence": divergence.mean().detach().cpu().numpy().item(),
-            "flow_loss": loss.detach().cpu().numpy().item(),
-        }
-        # x_t, t, dx_dt, weights = sample_weighted_interpolated_points(
-        #     argus=self.argus, observations=observations, actions=actions, energy=None, beta=self.argus.beta,
-        #     energy_model=self.energy_model, weighted_samples_type=WeightedSamplesType.linear_interpolation,
-        #     clip_value=self.argus.x_t_clip_value,
-        # )
-        # pred_u = self.model(x=torch.cat([observations, x_t], dim=-1), t=t)
-        # pred_u = pred_u.clip(-self.argus.x_t_clip_value, self.argus.x_t_clip_value)
-        # with torch.no_grad():
-        #     behavior_u = self.behavior_flow(x=torch.cat([observations, x_t], dim=-1), t=t)
-        # divergence = torch.norm(pred_u - behavior_u, dim=-1, keepdim=True)
-        # pred_Q = self.flow_energy_model.q_target(x=torch.cat([observations, x_t, pred_u], dim=-1), t=t)
-        # with torch.no_grad():
-        #     normed_pred_u = pred_u / torch.norm(pred_u, dim=-1, keepdim=True)
-        #     pred_V = self.flow_energy_model.v(x=torch.cat([observations, x_t, normed_pred_u], dim=-1), t=t)
-        # # loss = divergence - (pred_Q - pred_V.detach())
-        # adv = pred_Q - pred_V.detach()
-        # adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        # loss = - adv
-        #
-        # loss = loss.mean()
-        # self.optimizer.zero_grad()
-        # loss.backward()
-        # self.optimizer.step()
-        # self.fv_optimizer.zero_grad()
-        # self.ema.update_model_average(self.target_model, self.model)
-        # return {
-        #     "flow_divergence_coef": self.argus.divergence_coef,
-        #     "flow_divergence": divergence.mean().detach().cpu().numpy().item(),
-        #     "flow_loss": loss.detach().cpu().numpy().item(),
-        # }
 
     def adv_based_flow_train(self, num_epochs, num_steps_per_epoch):
         try:
@@ -1037,9 +960,9 @@ class guided_flow_trainer():
                     loss.update(energy_loss_info)
                 if update_flow:
                     flow_loss_info = self.adv_based_value_train(
-                        observations=observations[:-1], actions=actions[:-1], next_observations=observations[1:], next_actions=actions[1:], multiple_actions=self.argus.adv_rl_multiple_actions)
+                        observations=observations[:-1], actions=actions[:-1])
                     loss.update(flow_loss_info)
-                    flow_loss_info = self.adv_based_policy_train(observations=observations[:-1], actions=actions[:-1], next_observations=observations[1:], next_actions=actions[1:])
+                    flow_loss_info = self.adv_based_policy_train(observations=observations[:-1], actions=actions[:-1])
                     loss.update(flow_loss_info)
 
                 if self.wandb_log:
@@ -1076,41 +999,8 @@ class guided_flow_trainer():
         print(eval_results)
         print(f"Evaluation end ......")
 
-    def grpo_value_train(self, observations, actions, next_observations, next_actions, multiple_actions=20):
-        x_t, t, dx_dt, _ = sample_weighted_interpolated_points(
-            argus=self.argus, observations=observations, actions=actions, energy=None, beta=self.argus.beta,
-            energy_model=self.energy_model, weighted_samples_type=WeightedSamplesType.linear_interpolation,
-            clip_value=self.argus.x_t_clip_value,
-        )
-        # noise_x_t = (x_t + torch.randn_like(x_t)).clip(-self.argus.x_t_clip_value, self.argus.x_t_clip_value)
-        # noise_dxdt = (dx_dt + torch.randn_like(dx_dt)).clip(-self.argus.x_t_clip_value, self.argus.x_t_clip_value)
-        Q = self.flow_energy_model.q(x=torch.cat([observations, x_t, dx_dt], dim=-1), t=t)
-        # conservative_q_loss = torch.logsumexp(
-        #     self.flow_energy_model.q(x=torch.cat([observations, noise_x_t, noise_dxdt], dim=-1), t=t), dim=0) - Q.mean()
-        normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True)
-        # normed_noise_dxdt = noise_dxdt / torch.norm(noise_dxdt, dim=-1, keepdim=True)
-        V = self.flow_energy_model.v(x=torch.cat([observations, x_t, normed_dx_dt], dim=-1), t=t)
-        # conservative_v_loss = torch.logsumexp(
-        #     self.flow_energy_model.v(x=torch.cat([observations, noise_x_t, normed_dx_dt], dim=-1), t=t), dim=0) - V.mean()
-        with torch.no_grad():
-            target_fv = self.energy_model.get_scaled_q(obs=observations, act=actions, scale=self.argus.energy_scale)
-            # target_fv = self.energy_model.get_scaled_min_qs(obs=observations, act=actions, scale=self.argus.energy_scale)
-        Q_loss = self.loss_fn(Q, target_fv.detach())  # + self.argus.conservative_coef * conservative_q_loss.mean()
-        V_loss = self.loss_fn(V, target_fv.detach())  # + self.argus.conservative_coef * conservative_v_loss.mean()
-        self.fv_optimizer.zero_grad()
-        Q_loss.backward()
-        self.fv_optimizer.step()
-        self.fv_v_optimizer.zero_grad()
-        V_loss.backward()
-        self.fv_v_optimizer.step()
-        self.ema.update_model_average(self.flow_energy_model.q_target, self.flow_energy_model.q)
-        return {
-            # "value_divergence": total_divergence.mean().detach().cpu().numpy().item(),
-            "flow_value_loss": Q_loss.detach().cpu().numpy().item(),
-            "flow_v_value_loss": V_loss.detach().cpu().numpy().item(),
-            "flow_value": Q.mean().detach().cpu().numpy().item(),
-            "flow_v_value": V.mean().detach().cpu().numpy().item(),
-        }
+    def grpo_value_train(self, observations, actions):
+        return self.adv_based_value_train(observations=observations, actions=actions)
 
     def grpo_policy_train(self, observations, actions, next_observations, next_actions, expectile=0.5):
         x_t, t, dx_dt, weights = sample_weighted_interpolated_points(
@@ -1197,7 +1087,7 @@ class guided_flow_trainer():
                     loss.update(energy_loss_info)
                 if update_flow:
                     flow_loss_info = self.grpo_value_train(
-                        observations=observations[:-1], actions=actions[:-1], next_observations=observations[1:], next_actions=actions[1:], multiple_actions=self.argus.adv_rl_multiple_actions)
+                        observations=observations[:-1], actions=actions[:-1])
                     loss.update(flow_loss_info)
                     flow_loss_info = self.grpo_policy_train(observations=observations[:-1], actions=actions[:-1], next_observations=observations[1:], next_actions=actions[1:],
                                                             expectile=self.argus.gfpo_expectile)

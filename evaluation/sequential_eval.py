@@ -1,6 +1,7 @@
 import numpy as np
 import time
 from trainer.trainer_util import to_torch, to_np
+from trainer.shared_flow_rl_core import generate_train_flow_action
 from datasets_process.dataset_util import get_multi_task_name
 import copy
 from datasets_process.dataset_util import load_environment
@@ -135,14 +136,20 @@ def parallel_d4rl_eval_score_function_version(
     start_time = time.time()
     while np.sum(done) < eval_episodes:
         if argus.train_with_normed_data:
-            action = to_np(model.gen_action(
+            action = to_np(generate_train_flow_action(
+                flow_model=model,
+                critic=critic,
                 states=to_torch(dataset.normalizer.normalize(x=obs, key="observations"), device=argus.device),
-                critic=critic, steps=argus.flow_step, x_t_clip_value=argus.x_t_clip_value, executed_actions=executed_actions,
+                previous_actions=executed_actions,
+                config=argus,
             ))
         else:
-            action = to_np(model.gen_action(
-                states=to_torch(obs, device=argus.device), critic=critic, steps=argus.flow_step,
-                x_t_clip_value=argus.x_t_clip_value, executed_actions=executed_actions,
+            action = to_np(generate_train_flow_action(
+                flow_model=model,
+                critic=critic,
+                states=to_torch(obs, device=argus.device),
+                previous_actions=executed_actions,
+                config=argus,
             ))
         executed_actions = to_torch(action, device=argus.device)
         next_obs = copy.deepcopy(obs)
@@ -197,14 +204,22 @@ def parallel_d4rl_eval_adaptive_flow_step(
     start_time = time.time()
     while np.sum(done) < eval_episodes:
         if argus.train_with_normed_data:
-            action = to_np(model.gen_action(
+            action = to_np(generate_train_flow_action(
+                flow_model=model,
+                critic=critic,
                 states=to_torch(dataset.normalizer.normalize(x=obs, key="observations"), device=argus.device),
-                critic=critic, steps=argus.eval_flow_step, x_t_clip_value=argus.x_t_clip_value, executed_actions=executed_actions,
+                previous_actions=executed_actions,
+                config=argus,
+                flow_steps=argus.eval_flow_step,
             ))
         else:
-            action = to_np(model.gen_action(
-                states=to_torch(obs, device=argus.device), critic=critic, steps=argus.eval_flow_step,
-                x_t_clip_value=argus.x_t_clip_value, executed_actions=executed_actions,
+            action = to_np(generate_train_flow_action(
+                flow_model=model,
+                critic=critic,
+                states=to_torch(obs, device=argus.device),
+                previous_actions=executed_actions,
+                config=argus,
+                flow_steps=argus.eval_flow_step,
             ))
         executed_actions = to_torch(action, device=argus.device)
         next_obs = copy.deepcopy(obs)

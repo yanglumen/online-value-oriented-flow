@@ -35,12 +35,12 @@ online_multistep_rl_flow_parameters = {
     "lr": 0.00005,
     "batch_size": 256,
     "divergence_coef": 3.0,
-    "online_adv_batch_norm": True,
     "multi_mode_action_evaluation": False,
     "online_action_noise_std": 0.3,
     "online_action_noise_clip": 1.0,
     "online_action_noise_enable": True,
     "online_eval_deterministic": True,
+    "online_eval_stochastic": True,
     "normalizer": "OnlineGaussianNormalizer",
     "debug_mode": False,
     "wandb_log": True,
@@ -67,11 +67,8 @@ online_multistep_rl_flow_parameters = {
     "online_random_steps": 5000,
     "online_eval_freq": 5000,
     "load_offline_checkpoint": False,
-    "online_eval_policy_stochastic": False,
-    "online_late_phase_start_epoch": -1,
-    "online_late_lr_scale": 1.0,
-    "online_late_divergence_scale": 1.0,
-    "online_late_update_ratio_scale": 1.0,
+    "offline_checkpoint_mode": "guided_flow",
+    "offline_checkpoint_domain": None,
 }
 
 
@@ -87,6 +84,7 @@ def import_parameters(var_kwargs=None, mode="online_multistep_rl_flow_parameters
     if mode != "online_multistep_rl_flow_parameters":
         raise Exception("The mode of import_parameters is wrong !!!")
     hyperparameters = dict(online_multistep_rl_flow_parameters)
+    hyperparameters.pop("adv_rl_multiple_actions", None)
     for key, val in base_parameters.items():
         if key not in hyperparameters:
             hyperparameters[key] = val
@@ -98,6 +96,22 @@ def import_parameters(var_kwargs=None, mode="online_multistep_rl_flow_parameters
     }
     if var_kwargs is None:
         var_kwargs = {}
+    removed_args = {
+        "adv_rl_multiple_actions": "adv_rl now uses the shared single-sample flow core; this argument is no longer read.",
+        "online_adv_batch_norm": "adv_rl now uses the shared raw-advantage objective; this flag only applied to removed online-only adv semantics.",
+        "online_eval_policy_stochastic": "use --online_eval_stochastic instead.",
+        "online_late_phase_start_epoch": "late-phase scaling is not implemented in the online trainer.",
+        "online_late_lr_scale": "late-phase scaling is not implemented in the online trainer.",
+        "online_late_divergence_scale": "late-phase scaling is not implemented in the online trainer.",
+        "online_late_update_ratio_scale": "late-phase scaling is not implemented in the online trainer.",
+    }
+    stale_args = sorted(set(var_kwargs) & set(removed_args))
+    if stale_args:
+        details = "; ".join(f"{key}: {removed_args[key]}" for key in stale_args)
+        raise ValueError(f"Removed or unused online argument(s): {details}")
+    unknown_args = sorted(set(var_kwargs) - set(hyperparameters))
+    if unknown_args:
+        raise ValueError(f"Unknown online argument(s): {unknown_args}")
     for enumerate_key, enumerate_var in enum_mapping.items():
         if enumerate_key in var_kwargs:
             var_kwargs[enumerate_key] = enumerate_var[var_kwargs[enumerate_key]]
@@ -113,6 +127,13 @@ def hyperparameter_finetuning(argus):
         )
     if argus.domain == "gym":
         argus.domain = "gymnasium"
+    argus.sequence_length = int(argus.sequence_length)
+    if argus.sequence_length < 2:
+        raise ValueError(
+            "Online adv_rl training requires sequence_length >= 2 so replay batches contain valid transitions."
+        )
+    if not (argus.online_eval_deterministic or argus.online_eval_stochastic):
+        raise ValueError("At least one online eval mode must be enabled.")
     if argus.critic_type != CriticType.iql:
         raise ValueError(
             "The online entrypoint is now standardized to critic_type='iql'."
@@ -180,8 +201,9 @@ def train(**var_kwargs):
         energy_model=energy_model, dataset=dataset)
 
     if argus.load_offline_checkpoint:
+        checkpoint_domain = argus.offline_checkpoint_domain or argus.domain
         trainer.load_critic_checkpoint(
-            loadpath=f"{argus.save_path}/guided_flow/{argus.domain}/{'_'.join(argus.dataset.split('-'))}/{argus.load_critic_model}")
+            loadpath=f"{argus.save_path}/{argus.offline_checkpoint_mode}/{checkpoint_domain}/{'_'.join(argus.dataset.split('-'))}/{argus.load_critic_model}")
 
     trainer.online_train(
         num_epochs=argus.online_epochs,
