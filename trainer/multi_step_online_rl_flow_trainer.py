@@ -89,6 +89,8 @@ class online_guided_flow_trainer(object):
         self.wandb_log_frequency = argus.wandb_log_frequency
         self.online_print_frequency = getattr(argus, "online_print_frequency", 1000)
         self.wandb_project_name = argus.wandb_project_name
+        self.wandb_mode = getattr(argus, "wandb_mode", None)
+        self.wandb_init_timeout = getattr(argus, "wandb_init_timeout", 120)
         self.best_model_info = {"guidance_scale": 0.0, "performance": -1e9, "performance_std": 0.0}
         if self.argus.rl_mode in [RLTrainMode.adv_rl, RLTrainMode.grpo] and self.argus.sequence_length < 2:
             raise ValueError(
@@ -103,7 +105,16 @@ class online_guided_flow_trainer(object):
         self.current_episode_steps = 0
 
         if self.wandb_log:
-            wandb.init(name=self.wandb_exp_name, group=self.wandb_exp_group, project=self.wandb_project_name, config=obj2dict(self.argus))
+            wandb_kwargs = {
+                "name": self.wandb_exp_name,
+                "group": self.wandb_exp_group,
+                "project": self.wandb_project_name,
+                "config": obj2dict(self.argus),
+                "settings": wandb.Settings(init_timeout=self.wandb_init_timeout),
+            }
+            if self.wandb_mode:
+                wandb_kwargs["mode"] = self.wandb_mode
+            wandb.init(**wandb_kwargs)
             wandb.define_metric("env_step")
             wandb.define_metric("replay_episodes")
             wandb.define_metric("replay_steps")
@@ -597,48 +608,52 @@ class online_guided_flow_trainer(object):
         return loss
 
     def online_train(self, num_epochs, rollout_steps_per_epoch, num_updates_per_epoch):
-        warmup_steps = max(self.argus.online_init_steps, self.argus.batch_size)
-        if self.dataset.__len__(indices_type="ac") < warmup_steps:
-            self.collect_rollouts(warmup_steps)
-        last_log_time = time.time()
-        for epoch in range(num_epochs):
-            rollout_returns, rollout_lengths, rollout_policy_stats = self.collect_rollouts(rollout_steps_per_epoch)
-            if rollout_returns:
-                train_stats = {
-                    "online_rollout_return": float(np.mean(rollout_returns)),
-                    "online_rollout_length": float(np.mean(rollout_lengths)),
-                    "env_step": self.env_step,
-                    "replay_episodes": self.dataset.replay_buffer.n_episodes,
-                    "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
-                    "flow_update_count": self.flow_update_count,
-                    "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
-                    "deploy_flow_allowed": float(self._deploy_flow_allowed()),
-                    "deploy_train_flow_prob": self._train_flow_deploy_prob(),
-                }
-            else:
-                train_stats = {
-                    "env_step": self.env_step,
-                    "replay_episodes": self.dataset.replay_buffer.n_episodes,
-                    "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
-                    "flow_update_count": self.flow_update_count,
-                    "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
-                    "deploy_flow_allowed": float(self._deploy_flow_allowed()),
-                    "deploy_train_flow_prob": self._train_flow_deploy_prob(),
-                }
-            train_stats.update(rollout_policy_stats)
+        try:
+            warmup_steps = max(self.argus.online_init_steps, self.argus.batch_size)
+            if self.dataset.__len__(indices_type="ac") < warmup_steps:
+                self.collect_rollouts(warmup_steps)
+            last_log_time = time.time()
+            for epoch in range(num_epochs):
+                rollout_returns, rollout_lengths, rollout_policy_stats = self.collect_rollouts(rollout_steps_per_epoch)
+                if rollout_returns:
+                    train_stats = {
+                        "online_rollout_return": float(np.mean(rollout_returns)),
+                        "online_rollout_length": float(np.mean(rollout_lengths)),
+                        "env_step": self.env_step,
+                        "replay_episodes": self.dataset.replay_buffer.n_episodes,
+                        "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
+                        "flow_update_count": self.flow_update_count,
+                        "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
+                        "deploy_flow_allowed": float(self._deploy_flow_allowed()),
+                        "deploy_train_flow_prob": self._train_flow_deploy_prob(),
+                    }
+                else:
+                    train_stats = {
+                        "env_step": self.env_step,
+                        "replay_episodes": self.dataset.replay_buffer.n_episodes,
+                        "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
+                        "flow_update_count": self.flow_update_count,
+                        "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
+                        "deploy_flow_allowed": float(self._deploy_flow_allowed()),
+                        "deploy_train_flow_prob": self._train_flow_deploy_prob(),
+                    }
+                train_stats.update(rollout_policy_stats)
 
-            for _ in range(num_updates_per_epoch):
-                loss = self._train_step(epoch)
-                if self.wandb_log and self.step % self.wandb_log_frequency == 0:
-                    wandb.log(self._compact_train_metrics(train_stats, loss), step=self.step)
-                if self.step > 0 and self.step % self.argus.online_eval_freq == 0:
-                    self.eval_online()
-                if self.step > 0 and self.step % self.save_freq == 0:
-                    self.save_critic_checpoint()
-                if self.step % self.online_print_frequency == 0:
-                    print(self._format_train_summary(epoch, train_stats, loss, time.time() - last_log_time))
-                    last_log_time = time.time()
-                self.step += 1
+                for _ in range(num_updates_per_epoch):
+                    loss = self._train_step(epoch)
+                    if self.wandb_log and self.step % self.wandb_log_frequency == 0:
+                        wandb.log(self._compact_train_metrics(train_stats, loss), step=self.step)
+                    if self.step > 0 and self.step % self.argus.online_eval_freq == 0:
+                        self.eval_online()
+                    if self.step > 0 and self.step % self.save_freq == 0:
+                        self.save_critic_checpoint()
+                    if self.step % self.online_print_frequency == 0:
+                        print(self._format_train_summary(epoch, train_stats, loss, time.time() - last_log_time))
+                        last_log_time = time.time()
+                    self.step += 1
+        finally:
+            if self.wandb_log and wandb.run is not None:
+                wandb.finish()
 
     def _eval_online_once(self, deterministic):
         eval_returns = []

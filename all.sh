@@ -18,6 +18,11 @@ RANDOM_STEPS="${RANDOM_STEPS:-5000}"
 EVAL_FREQ="${EVAL_FREQ:-1000}"
 BATCH_LOG_FREQ="${BATCH_LOG_FREQ:-100}"
 PRINT_FREQ="${PRINT_FREQ:-200}"
+WANDB_LOG="${WANDB_LOG:-True}"
+# Leave empty for normal online W&B logging. Set WANDB_MODE=offline only when
+# intentionally writing local runs that will be synced later.
+WANDB_MODE="${WANDB_MODE:-}"
+WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-180}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-2}"
 LR="${LR:-0.00005}"
@@ -60,6 +65,11 @@ run_experiment() {
   echo "Running label=${label} seed=${seed} behavior_only=${behavior_only}"
   echo "============================================================"
 
+  local wandb_mode_args=()
+  if [[ -n "$WANDB_MODE" ]]; then
+    wandb_mode_args=(--wandb_mode "$WANDB_MODE")
+  fi
+
   uv run python multi_step_online_rl_flow_main.py train \
     --dataset "$DATASET" \
     --domain "$DOMAIN" \
@@ -82,6 +92,9 @@ run_experiment() {
     --online_random_steps "$RANDOM_STEPS" \
     --update_flow_start_epoch "$UPDATE_FLOW_START_EPOCH" \
     --online_eval_freq "$EVAL_FREQ" \
+    --wandb_log "$WANDB_LOG" \
+    "${wandb_mode_args[@]}" \
+    --wandb_init_timeout "$WANDB_INIT_TIMEOUT" \
     --wandb_log_frequency "$BATCH_LOG_FREQ" \
     --online_print_frequency "$PRINT_FREQ" \
     --batch_size "$BATCH_SIZE" \
@@ -106,5 +119,5 @@ run_experiment() {
     --online_gradual_deploy_ramp_updates "$ONLINE_GRADUAL_DEPLOY_RAMP_UPDATES"
 }
 
-run_experiment "adv_rl_swdg" "$SEED" "False"
 run_experiment "behavior_only_swdg" "$SEED" "True"
+run_experiment "adv_rl_swdg" "$SEED" "False"

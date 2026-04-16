@@ -44,6 +44,8 @@ online_multistep_rl_flow_parameters = {
     "normalizer": "OnlineGaussianNormalizer",
     "debug_mode": False,
     "wandb_log": True,
+    "wandb_mode": None,
+    "wandb_init_timeout": 120,
     "wandb_project_name": "online_guided_flow",
     "wandb_log_frequency": 100,
     "online_print_frequency": 200,
