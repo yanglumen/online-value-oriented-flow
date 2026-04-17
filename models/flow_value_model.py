@@ -107,11 +107,12 @@ class TwinQ(nn.Module):
     def both(self, x, t):
         return self.q1(x, t=t), self.q2(x, t=t)
 
-    def forward(self, x, t, use_q1=True):
-        if use_q1:
+    def forward(self, x, t, use_q1=None):
+        if use_q1 is True:
             return self.q1(x, t=t)
-        else:
+        if use_q1 is False:
             return self.q2(x, t=t)
+        return torch.min(self.q1(x, t=t), self.q2(x, t=t))
 
 class ValueFunc(nn.Module):
     def __init__(self, state_dim):
@@ -130,10 +131,9 @@ class iql_flow_critic(nn.Module):
         self.use_TwinQ = use_TwinQ
         if use_TwinQ:
             self.q = TwinQ(input_dim=adim+sdim).to(args.device)
-            self.q_target = TwinQ(input_dim=adim+sdim).requires_grad_(False).to(args.device)
         else:
             self.q = flow_value_func(input_dim=sdim+adim).to(args.device)
-            self.q_target = flow_value_func(input_dim=sdim+adim).requires_grad_(False).to(args.device)
+        self.q_target = copy.deepcopy(self.q).requires_grad_(False).to(args.device)
         self.v = flow_value_func(input_dim=sdim+adim).to(args.device)
         self.ema = EMA(args.ema_decay)
 
@@ -148,6 +148,8 @@ class iql_flow_critic(nn.Module):
 
     def get_scaled_q(self, obs, act, t, scale=1.0):
         oa = torch.cat((obs, act), dim=-1)
+        if self.use_TwinQ:
+            return torch.min(*self.q.both(oa, t=t)) / scale
         return self.q(oa, t=t)/scale
 
     def get_qs(self, obs, act, t):
@@ -164,7 +166,10 @@ class iql_flow_critic(nn.Module):
         oa = torch.cat((observations, actions), dim=-1)
         onorma = torch.cat((observations, normed_actions), dim=-1)
         with torch.no_grad():
-            target_q = self.q_target(oa, t=t)
+            if self.use_TwinQ:
+                target_q = torch.min(*self.q_target.both(oa, t=t))
+            else:
+                target_q = self.q_target(oa, t=t)
         value = self.v(onorma, t=t)
         v0_loss = self.expectile_loss(tau=tau, u=target_q.detach() - value)
         return v0_loss, {"v0_mean_value": value.mean().detach().cpu().numpy().item(),
@@ -214,10 +219,9 @@ class adv_decision_flow_iql_flow_critic(nn.Module):
         self.use_TwinQ = use_TwinQ
         if use_TwinQ:
             self.q = TwinQ(input_dim=adim+sdim).to(args.device)
-            self.q_target = TwinQ(input_dim=adim+sdim).requires_grad_(False).to(args.device)
         else:
             self.q = flow_value_func(input_dim=sdim+adim).to(args.device)
-            self.q_target = flow_value_func(input_dim=sdim+adim).requires_grad_(False).to(args.device)
+        self.q_target = copy.deepcopy(self.q).requires_grad_(False).to(args.device)
         self.v = flow_value_func(input_dim=sdim+adim).to(args.device)
         self.ema = EMA(args.ema_decay)
 
@@ -232,10 +236,14 @@ class adv_decision_flow_iql_flow_critic(nn.Module):
 
     def get_scaled_q(self, obs, act, t, scale=1.0):
         oa = torch.cat((obs, act), dim=-1)
+        if self.use_TwinQ:
+            return torch.min(*self.q.both(oa, t=t)) / scale
         return self.q(oa, t=t)/scale
 
     def get_scaled_target_q(self, obs, act, t, scale=1.0):
         oa = torch.cat((obs, act), dim=-1)
+        if self.use_TwinQ:
+            return torch.min(*self.q_target.both(oa, t=t)) / scale
         return self.q_target(oa, t=t)/scale
 
     def get_scaled_v(self, obs, act, t, scale=1.0):
@@ -256,7 +264,10 @@ class adv_decision_flow_iql_flow_critic(nn.Module):
         oa = torch.cat((observations, actions), dim=-1)
         onorma = torch.cat((observations, normed_actions), dim=-1)
         with torch.no_grad():
-            target_q = self.q_target(oa, t=t)
+            if self.use_TwinQ:
+                target_q = torch.min(*self.q_target.both(oa, t=t))
+            else:
+                target_q = self.q_target(oa, t=t)
         value = self.v(onorma, t=t)
         v0_loss = self.expectile_loss(tau=tau, u=target_q.detach() - value)
         return v0_loss, {"v0_mean_value": value.mean().detach().cpu().numpy().item(),
@@ -306,10 +317,9 @@ class ciql_flow_critic(nn.Module):
         self.use_TwinQ = use_TwinQ
         if use_TwinQ:
             self.q = TwinQ(input_dim=adim+sdim).to(args.device)
-            self.q_target = TwinQ(input_dim=adim+sdim).requires_grad_(False).to(args.device)
         else:
             self.q = flow_value_func(input_dim=sdim+adim).to(args.device)
-            self.q_target = flow_value_func(input_dim=sdim+adim).requires_grad_(False).to(args.device)
+        self.q_target = copy.deepcopy(self.q).requires_grad_(False).to(args.device)
         self.v = flow_value_func(input_dim=sdim).to(args.device)
         self.ema = EMA(args.ema_decay)
 
@@ -318,6 +328,8 @@ class ciql_flow_critic(nn.Module):
 
     def get_scaled_q(self, obs, act, t, scale=1.0):
         oa = torch.cat((obs, act), dim=-1)
+        if self.use_TwinQ:
+            return torch.min(*self.q.both(oa, t=t)) / scale
         return self.q(oa, t=t)/scale
 
     def get_qs(self, obs, act, t):
@@ -333,7 +345,10 @@ class ciql_flow_critic(nn.Module):
     def expectile_v_loss(self, tau, observations, actions, t):
         oa = torch.cat((observations, actions), dim=-1)
         with torch.no_grad():
-            target_q = self.q_target(oa, t=t)
+            if self.use_TwinQ:
+                target_q = torch.min(*self.q_target.both(oa, t=t))
+            else:
+                target_q = self.q_target(oa, t=t)
         value = self.v(observations, t=t)
         v0_loss = self.expectile_loss(tau=tau, u=target_q.detach() - value)
         return v0_loss, {"v0_mean_value": value.mean().detach().cpu().numpy().item(),

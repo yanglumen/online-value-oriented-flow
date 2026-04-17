@@ -33,12 +33,17 @@ online_multistep_rl_flow_parameters = {
     "swdg_use_diversity_reg": False,
     "swdg_diversity_coef": 0.0,
     "lr": 0.00005,
-    "batch_size": 256,
+    "batch_size": 512,
     "divergence_coef": 3.0,
+    "adv_batch_norm": True,
     "multi_mode_action_evaluation": False,
-    "online_action_noise_std": 0.3,
+    "online_action_noise_std": 0.5,
     "online_action_noise_clip": 1.0,
     "online_action_noise_enable": True,
+    "online_action_noise_decay_enable": True,
+    "online_action_noise_start_std": 0.5,
+    "online_action_noise_end_std": 0.1,
+    "online_action_noise_decay_steps": 1000000,
     "online_eval_deterministic": True,
     "online_eval_stochastic": True,
     "normalizer": "OnlineGaussianNormalizer",
@@ -100,7 +105,6 @@ def import_parameters(var_kwargs=None, mode="online_multistep_rl_flow_parameters
         var_kwargs = {}
     removed_args = {
         "adv_rl_multiple_actions": "adv_rl now uses the shared single-sample flow core; this argument is no longer read.",
-        "online_adv_batch_norm": "adv_rl now uses the shared raw-advantage objective; this flag only applied to removed online-only adv semantics.",
         "online_eval_policy_stochastic": "use --online_eval_stochastic instead.",
         "online_late_phase_start_epoch": "late-phase scaling is not implemented in the online trainer.",
         "online_late_lr_scale": "late-phase scaling is not implemented in the online trainer.",
@@ -111,6 +115,8 @@ def import_parameters(var_kwargs=None, mode="online_multistep_rl_flow_parameters
     if stale_args:
         details = "; ".join(f"{key}: {removed_args[key]}" for key in stale_args)
         raise ValueError(f"Removed or unused online argument(s): {details}")
+    if "online_adv_batch_norm" in var_kwargs:
+        var_kwargs["adv_batch_norm"] = var_kwargs.pop("online_adv_batch_norm")
     unknown_args = sorted(set(var_kwargs) - set(hyperparameters))
     if unknown_args:
         raise ValueError(f"Unknown online argument(s): {unknown_args}")

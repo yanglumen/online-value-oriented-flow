@@ -23,15 +23,20 @@ WANDB_LOG="${WANDB_LOG:-True}"
 # intentionally writing local runs that will be synced later.
 WANDB_MODE="${WANDB_MODE:-}"
 WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-180}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-2}"
 LR="${LR:-0.00005}"
 DIVERGENCE_COEF="${DIVERGENCE_COEF:-3.0}"
+ADV_BATCH_NORM="${ADV_BATCH_NORM:-True}"
 PRESERVE_EP="${PRESERVE_EP:-300}"
 MULTI_MODE_ACTION_EVALUATION="${MULTI_MODE_ACTION_EVALUATION:-False}"
 ONLINE_ACTION_NOISE_ENABLE="${ONLINE_ACTION_NOISE_ENABLE:-True}"
-ONLINE_ACTION_NOISE_STD="${ONLINE_ACTION_NOISE_STD:-0.3}"
+ONLINE_ACTION_NOISE_STD="${ONLINE_ACTION_NOISE_STD:-0.5}"
 ONLINE_ACTION_NOISE_CLIP="${ONLINE_ACTION_NOISE_CLIP:-1.0}"
+ONLINE_ACTION_NOISE_DECAY_ENABLE="${ONLINE_ACTION_NOISE_DECAY_ENABLE:-True}"
+ONLINE_ACTION_NOISE_START_STD="${ONLINE_ACTION_NOISE_START_STD:-0.5}"
+ONLINE_ACTION_NOISE_END_STD="${ONLINE_ACTION_NOISE_END_STD:-0.1}"
+ONLINE_ACTION_NOISE_DECAY_STEPS="${ONLINE_ACTION_NOISE_DECAY_STEPS:-1000000}"
 ONLINE_EVAL_DETERMINISTIC="${ONLINE_EVAL_DETERMINISTIC:-True}"
 ONLINE_EVAL_STOCHASTIC="${ONLINE_EVAL_STOCHASTIC:-True}"
 ONLINE_USE_SLIDING_WINDOW_CRITIC="${ONLINE_USE_SLIDING_WINDOW_CRITIC:-True}"
@@ -101,11 +106,16 @@ run_experiment() {
     --sequence_length "$SEQUENCE_LENGTH" \
     --lr "$LR" \
     --divergence_coef "$DIVERGENCE_COEF" \
+    --adv_batch_norm "$ADV_BATCH_NORM" \
     --preserve_ep "$PRESERVE_EP" \
     --multi_mode_action_evaluation "$MULTI_MODE_ACTION_EVALUATION" \
     --online_action_noise_enable "$ONLINE_ACTION_NOISE_ENABLE" \
     --online_action_noise_std "$ONLINE_ACTION_NOISE_STD" \
     --online_action_noise_clip "$ONLINE_ACTION_NOISE_CLIP" \
+    --online_action_noise_decay_enable "$ONLINE_ACTION_NOISE_DECAY_ENABLE" \
+    --online_action_noise_start_std "$ONLINE_ACTION_NOISE_START_STD" \
+    --online_action_noise_end_std "$ONLINE_ACTION_NOISE_END_STD" \
+    --online_action_noise_decay_steps "$ONLINE_ACTION_NOISE_DECAY_STEPS" \
     --online_eval_deterministic "$ONLINE_EVAL_DETERMINISTIC" \
     --online_eval_stochastic "$ONLINE_EVAL_STOCHASTIC" \
     --online_behavior_bootstrap_updates "$ONLINE_BEHAVIOR_BOOTSTRAP_UPDATES" \
@@ -119,5 +129,5 @@ run_experiment() {
     --online_gradual_deploy_ramp_updates "$ONLINE_GRADUAL_DEPLOY_RAMP_UPDATES"
 }
 
-run_experiment "behavior_only_swdg" "$SEED" "True"
 run_experiment "adv_rl_swdg" "$SEED" "False"
+run_experiment "behavior_only_swdg" "$SEED" "True"

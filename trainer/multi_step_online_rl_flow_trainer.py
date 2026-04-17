@@ -151,6 +151,7 @@ class online_guided_flow_trainer(object):
             "rollout_policy_train_flow_frac",
             "deploy_flow_allowed",
             "deploy_train_flow_prob",
+            "online_action_noise_std_current",
         ]:
             if key in train_stats:
                 metrics[key] = train_stats[key]
@@ -163,6 +164,8 @@ class online_guided_flow_trainer(object):
             "flow_v_value_loss",
             "flow_divergence",
             "flow_loss",
+            "flow_adv_mean",
+            "flow_adv_std",
             "flow_behavior_action_l2_mean",
             "flow_behavior_action_l2_std",
             "train_action_clip_frac",
@@ -389,12 +392,23 @@ class online_guided_flow_trainer(object):
             "rollout_policy_train_flow_frac": float(policy_counts.get(2, 0) / total_steps),
         }
 
+    def _current_action_noise_std(self):
+        if not getattr(self.argus, "online_action_noise_decay_enable", False):
+            return float(getattr(self.argus, "online_action_noise_std", 0.0))
+        start_std = float(getattr(self.argus, "online_action_noise_start_std", 0.5))
+        end_std = float(getattr(self.argus, "online_action_noise_end_std", 0.1))
+        decay_steps = max(1, int(getattr(self.argus, "online_action_noise_decay_steps", 1000000)))
+        progress = min(1.0, max(0.0, float(self.env_step) / decay_steps))
+        if start_std <= 0.0 or end_std <= 0.0:
+            return end_std + (start_std - end_std) * (1.0 - progress)
+        return start_std * ((end_std / start_std) ** progress)
+
     def _apply_training_action_noise(self, action_tensor):
         # TODO(online/offline): Exploration noise is online-only. The replayed
         # action target may include this post-policy noise, unlike offline data.
         if not getattr(self.argus, "online_action_noise_enable", False):
             return action_tensor
-        noise_std = float(getattr(self.argus, "online_action_noise_std", 0.0))
+        noise_std = self._current_action_noise_std()
         if noise_std <= 0:
             return action_tensor
         noise = torch.randn_like(action_tensor) * noise_std
@@ -626,6 +640,7 @@ class online_guided_flow_trainer(object):
                         "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
                         "deploy_flow_allowed": float(self._deploy_flow_allowed()),
                         "deploy_train_flow_prob": self._train_flow_deploy_prob(),
+                        "online_action_noise_std_current": self._current_action_noise_std(),
                     }
                 else:
                     train_stats = {
@@ -636,6 +651,7 @@ class online_guided_flow_trainer(object):
                         "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
                         "deploy_flow_allowed": float(self._deploy_flow_allowed()),
                         "deploy_train_flow_prob": self._train_flow_deploy_prob(),
+                        "online_action_noise_std_current": self._current_action_noise_std(),
                     }
                 train_stats.update(rollout_policy_stats)
 

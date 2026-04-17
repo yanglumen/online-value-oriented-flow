@@ -57,13 +57,13 @@ class TwinQ(nn.Module):
         as_ = torch.cat([action, condition], -1) if condition is not None else action
         return self.q1(as_), self.q2(as_)
 
-    def forward(self, action, condition=None, use_q1=True):
-        # return torch.min(*self.both(action, condition))
+    def forward(self, action, condition=None, use_q1=None):
         as_ = torch.cat([action, condition], -1) if condition is not None else action
-        if use_q1:
+        if use_q1 is True:
             return self.q1(as_)
-        else:
+        if use_q1 is False:
             return self.q2(as_)
+        return torch.min(self.q1(as_), self.q2(as_))
 
 class ValueFunc(nn.Module):
     def __init__(self, state_dim):
@@ -178,10 +178,10 @@ class grpo_iql_critic(nn.Module):
         self.discount = args.discount
         self.argus = args
         self.q = TwinQ(adim, sdim, args).to(args.device)
-        self.q_target = TwinQ(adim, sdim, args).requires_grad_(False).to(args.device)
+        self.q_target = copy.deepcopy(self.q).requires_grad_(False).to(args.device)
         self.v = ValueFunc(sdim).to(args.device)
         self.flow_v = ValueFunc(sdim+adim+adim).to(args.device)
-        self.target_flow_v = ValueFunc(sdim+adim+adim).requires_grad_(False).to(args.device)
+        self.target_flow_v = copy.deepcopy(self.flow_v).requires_grad_(False).to(args.device)
         self.ema = EMA(args.ema_decay)
 
     def q_ema(self):
@@ -191,7 +191,7 @@ class grpo_iql_critic(nn.Module):
         self.ema.update_model_average(self.target_flow_v, self.flow_v)
 
     def get_scaled_q(self, obs, act, scale=1.0):
-        return self.q(action=act, condition=obs)/scale
+        return torch.min(*self.q.both(action=act, condition=obs)) / scale
 
     def get_qs(self, obs, act):
         return self.q.both(action=act, condition=obs)
@@ -204,7 +204,7 @@ class grpo_iql_critic(nn.Module):
 
     def expectile_v_loss(self, tau, observations, actions):
         with torch.no_grad():
-            target_q = self.q_target(actions, observations)
+            target_q = torch.min(*self.q_target.both(actions, observations))
         value = self.v(observations)
         v0_loss = self.expectile_loss(tau=tau, u=target_q.detach() - value)
         return v0_loss, {"v0_mean_value": value.mean().detach().cpu().numpy().item(),
@@ -254,10 +254,10 @@ class grpo_iql_critic(nn.Module):
                 multi_x.append(x)
                 step_index += 1
             x = torch.clamp(x, min=-self.argus.max_action_val, max=self.argus.max_action_val)
-            # target_qs1, target_qs2 = self.q_target.both(x, next_observations)
-            # min_Q = torch.min(torch.cat([target_qs1, target_qs2], dim=-1), dim=-1, keepdim=True).values
-            target_q = self.q_target(x, next_observations.unsqueeze(1).repeat(1, multiple_actions, 1))
-            min_Q = target_q
+            target_qs1, target_qs2 = self.q_target.both(
+                x, next_observations.unsqueeze(1).repeat(1, multiple_actions, 1)
+            )
+            min_Q = torch.min(target_qs1, target_qs2)
         flow_v_loss = 0
         for step_i in range(len(multi_divergence)):
             target_flow_V = - self.argus.divergence_coef * torch.sum(torch.cat(multi_divergence[step_i:], dim=-1), dim=-1, keepdim=True) + min_Q.detach()

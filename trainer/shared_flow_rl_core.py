@@ -157,7 +157,12 @@ def adv_policy_update(batch, models, optimizers, config):
     normed_pred_u = pred_u / torch.norm(pred_u, dim=-1, keepdim=True)
     pred_q = flow_energy_model.q(x=torch.cat([observations, x_t, pred_u], dim=-1), t=t)
     pred_v = flow_energy_model.v(x=torch.cat([observations, x_t, normed_pred_u], dim=-1), t=t)
-    loss = config.divergence_coef * divergence + (pred_v.detach() - pred_q).mean()
+    advantage = pred_q - pred_v.detach()
+    if getattr(config, "adv_batch_norm", False):
+        adv_mean = advantage.mean().detach()
+        adv_std = advantage.std(unbiased=False).detach()
+        advantage = (advantage - adv_mean) / (adv_std + 1e-6)
+    loss = config.divergence_coef * divergence - advantage.mean()
 
     flow_optimizer.zero_grad()
     loss.backward()
@@ -169,4 +174,6 @@ def adv_policy_update(batch, models, optimizers, config):
         "flow_divergence_coef": config.divergence_coef,
         "flow_divergence": _item(divergence.mean()),
         "flow_loss": _item(loss),
+        "flow_adv_mean": _item((pred_q - pred_v.detach()).mean()),
+        "flow_adv_std": _item((pred_q - pred_v.detach()).std(unbiased=False)),
     }

@@ -55,13 +55,13 @@ class TwinQ(nn.Module):
         as_ = torch.cat([action, condition], -1) if condition is not None else action
         return self.q1(as_), self.q2(as_)
 
-    def forward(self, action, condition=None, use_q1=True):
-        # return torch.min(*self.both(action, condition))
+    def forward(self, action, condition=None, use_q1=None):
         as_ = torch.cat([action, condition], -1) if condition is not None else action
-        if use_q1:
+        if use_q1 is True:
             return self.q1(as_)
-        else:
-            return torch.min(*self.both(action, condition))
+        if use_q1 is False:
+            return self.q2(as_)
+        return torch.min(self.q1(as_), self.q2(as_))
 
 class ValueFunc(nn.Module):
     def __init__(self, state_dim):
@@ -104,10 +104,10 @@ class iql_critic(nn.Module):
         self.ema.update_model_average(self.q_target, self.q)
 
     def get_scaled_target_q(self, obs, act, scale=1.0):
-        return self.q_target(action=act, condition=obs)/scale
+        return torch.min(*self.q_target.both(action=act, condition=obs)) / scale
 
     def get_scaled_q(self, obs, act, scale=1.0):
-        return self.q(action=act, condition=obs)/scale
+        return torch.min(*self.q.both(action=act, condition=obs)) / scale
 
     def get_scaled_v(self, obs, scale=1.0):
         return self.v(state=obs)/scale
@@ -127,7 +127,7 @@ class iql_critic(nn.Module):
 
     def expectile_v_loss(self, tau, observations, actions):
         with torch.no_grad():
-            target_q = self.q_target(actions, observations)
+            target_q = torch.min(*self.q_target.both(actions, observations))
         value = self.v(observations)
         v0_loss = self.expectile_loss(tau=tau, u=target_q.detach() - value)
         return v0_loss, {"v0_mean_value": value.mean().detach().cpu().numpy().item(),
@@ -176,10 +176,10 @@ class ciql_critic(nn.Module):
         self.ema.update_model_average(self.q_target, self.q)
 
     def get_scaled_target_q(self, obs, act, scale=1.0):
-        return self.q_target(action=act, condition=obs)/scale
+        return torch.min(*self.q_target.both(action=act, condition=obs)) / scale
 
     def get_scaled_q(self, obs, act, scale=1.0):
-        return self.q(action=act, condition=obs)/scale
+        return torch.min(*self.q.both(action=act, condition=obs)) / scale
 
     def get_qs(self, obs, act):
         return self.q_target.both(action=act, condition=obs)
@@ -195,7 +195,7 @@ class ciql_critic(nn.Module):
 
     def expectile_v_loss(self, tau, observations, actions):
         with torch.no_grad():
-            target_q = self.q_target(actions, observations)
+            target_q = torch.min(*self.q_target.both(actions, observations))
         value = self.v(observations)
         v0_loss = self.expectile_loss(tau=tau, u=target_q.detach() - value)
         return v0_loss, {"v0_mean_value": value.mean().detach().cpu().numpy().item(),
@@ -247,16 +247,18 @@ class in_support_softmax_q_learning_critic(nn.Module):
         self.discount = args.discount
         self.args = args
         self.q = TwinQ(adim, sdim, args).to(args.device)
-        self.q_target = TwinQ(adim, sdim, args).to(args.device).requires_grad_(False)
+        self.q_target = copy.deepcopy(self.q).requires_grad_(False).to(args.device)
         self.ema = EMA(args.ema_decay)
 
     def q_ema(self):
         self.ema.update_model_average(self.q_target, self.q)
 
     def get_scaled_target_q(self, obs, act, scale=1.0):
-        return self.q_target(action=act, condition=obs)/scale
+        return torch.min(*self.q_target.both(action=act, condition=obs)) / scale
 
-    def get_scaled_q(self, obs, act, scale=1.0, use_q1=True):
+    def get_scaled_q(self, obs, act, scale=1.0, use_q1=None):
+        if use_q1 is None:
+            return torch.min(*self.q.both(action=act, condition=obs)) / scale
         return self.q(action=act, condition=obs, use_q1=use_q1)/scale
 
     def get_qs(self, obs, act):

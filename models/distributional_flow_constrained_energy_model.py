@@ -56,13 +56,13 @@ class TwinQ(nn.Module):
         as_ = torch.cat([action, condition], -1) if condition is not None else action
         return self.q1(as_), self.q2(as_)
 
-    def forward(self, action, condition=None, use_q1=True):
-        # return torch.min(*self.both(action, condition))
+    def forward(self, action, condition=None, use_q1=None):
         as_ = torch.cat([action, condition], -1) if condition is not None else action
-        if use_q1:
+        if use_q1 is True:
             return self.q1(as_)
-        else:
+        if use_q1 is False:
             return self.q2(as_)
+        return torch.min(self.q1(as_), self.q2(as_))
 
 class ValueFunc(nn.Module):
     def __init__(self, state_dim):
