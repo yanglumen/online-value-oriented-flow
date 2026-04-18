@@ -152,6 +152,8 @@ class online_guided_flow_trainer(object):
             "deploy_flow_allowed",
             "deploy_train_flow_prob",
             "online_action_noise_std_current",
+            "policy_update_count",
+            "critic_update_interval",
         ]:
             if key in train_stats:
                 metrics[key] = train_stats[key]
@@ -173,6 +175,7 @@ class online_guided_flow_trainer(object):
             "critic_train_action_q_mean",
             "critic_behavior_action_q_mean",
             "critic_train_minus_behavior_q_mean",
+            "critic_updated",
         ]:
             if key in loss:
                 metrics[key] = loss[key]
@@ -222,6 +225,8 @@ class online_guided_flow_trainer(object):
             parts.append(f"RolloutLen {train_stats['online_rollout_length']:.1f}")
         if "flow_update_count" in train_stats:
             parts.append(f"FlowUpdates {int(train_stats['flow_update_count'])}")
+        if "critic_update_interval" in train_stats:
+            parts.append(f"CriticEvery {int(train_stats['critic_update_interval'])}")
         if "train_flow_initialized_from_behavior" in train_stats:
             parts.append(f"InitFromBF {int(train_stats['train_flow_initialized_from_behavior'])}")
         if "rollout_policy_id" in train_stats:
@@ -572,6 +577,22 @@ class online_guided_flow_trainer(object):
             update_energy = False
             update_flow = False
             update_behavior = True
+        critic_update_interval = max(1, int(getattr(self.argus, "online_critic_update_interval", 1)))
+        adv_policy_step_available = (
+            update_flow
+            and self.argus.rl_mode == RLTrainMode.adv_rl
+            and transition_observations.shape[0] > 0
+        )
+        update_adv_critic = (
+            not update_flow
+            or self.argus.rl_mode != RLTrainMode.adv_rl
+            or (
+                adv_policy_step_available
+                and self.flow_update_count % critic_update_interval == 0
+            )
+        )
+        if update_energy and self.argus.rl_mode == RLTrainMode.adv_rl:
+            update_energy = update_adv_critic
         loss = {}
         if update_energy:
             loss.update(self.energy_train(
@@ -587,10 +608,12 @@ class online_guided_flow_trainer(object):
                 loss.update(self.flow_train(observations=observations, actions=actions))
             elif self.argus.rl_mode == RLTrainMode.adv_rl:
                 if transition_observations.shape[0] > 0:
-                    loss.update(self.adv_based_value_train(
-                        observations=transition_observations, actions=transition_actions))
+                    if update_adv_critic:
+                        loss.update(self.adv_based_value_train(
+                            observations=transition_observations, actions=transition_actions))
                     loss.update(self.adv_based_policy_train(
                         observations=transition_observations, actions=transition_actions))
+                    loss["critic_updated"] = float(update_adv_critic)
                     self.flow_update_count += 1
             elif self.argus.rl_mode == RLTrainMode.grpo:
                 if transition_observations.shape[0] > 0:
@@ -623,39 +646,51 @@ class online_guided_flow_trainer(object):
 
     def online_train(self, num_epochs, rollout_steps_per_epoch, num_updates_per_epoch):
         try:
+            if int(num_updates_per_epoch) != int(rollout_steps_per_epoch):
+                print(
+                    "Using one online update per environment step; "
+                    f"overriding online_updates_per_epoch={num_updates_per_epoch} "
+                    f"with rollout_steps_per_epoch={rollout_steps_per_epoch}."
+                )
+                num_updates_per_epoch = rollout_steps_per_epoch
+                self.argus.online_updates_per_epoch = rollout_steps_per_epoch
             warmup_steps = max(self.argus.online_init_steps, self.argus.batch_size)
             if self.dataset.__len__(indices_type="ac") < warmup_steps:
                 self.collect_rollouts(warmup_steps)
             last_log_time = time.time()
             for epoch in range(num_epochs):
-                rollout_returns, rollout_lengths, rollout_policy_stats = self.collect_rollouts(rollout_steps_per_epoch)
-                if rollout_returns:
-                    train_stats = {
-                        "online_rollout_return": float(np.mean(rollout_returns)),
-                        "online_rollout_length": float(np.mean(rollout_lengths)),
-                        "env_step": self.env_step,
-                        "replay_episodes": self.dataset.replay_buffer.n_episodes,
-                        "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
-                        "flow_update_count": self.flow_update_count,
-                        "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
-                        "deploy_flow_allowed": float(self._deploy_flow_allowed()),
-                        "deploy_train_flow_prob": self._train_flow_deploy_prob(),
-                        "online_action_noise_std_current": self._current_action_noise_std(),
-                    }
-                else:
-                    train_stats = {
-                        "env_step": self.env_step,
-                        "replay_episodes": self.dataset.replay_buffer.n_episodes,
-                        "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
-                        "flow_update_count": self.flow_update_count,
-                        "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
-                        "deploy_flow_allowed": float(self._deploy_flow_allowed()),
-                        "deploy_train_flow_prob": self._train_flow_deploy_prob(),
-                        "online_action_noise_std_current": self._current_action_noise_std(),
-                    }
-                train_stats.update(rollout_policy_stats)
+                for _ in range(rollout_steps_per_epoch):
+                    rollout_returns, rollout_lengths, rollout_policy_stats = self.collect_rollouts(1)
+                    if rollout_returns:
+                        train_stats = {
+                            "online_rollout_return": float(np.mean(rollout_returns)),
+                            "online_rollout_length": float(np.mean(rollout_lengths)),
+                            "env_step": self.env_step,
+                            "replay_episodes": self.dataset.replay_buffer.n_episodes,
+                            "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
+                            "flow_update_count": self.flow_update_count,
+                            "policy_update_count": self.flow_update_count,
+                            "critic_update_interval": max(1, int(getattr(self.argus, "online_critic_update_interval", 1))),
+                            "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
+                            "deploy_flow_allowed": float(self._deploy_flow_allowed()),
+                            "deploy_train_flow_prob": self._train_flow_deploy_prob(),
+                            "online_action_noise_std_current": self._current_action_noise_std(),
+                        }
+                    else:
+                        train_stats = {
+                            "env_step": self.env_step,
+                            "replay_episodes": self.dataset.replay_buffer.n_episodes,
+                            "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
+                            "flow_update_count": self.flow_update_count,
+                            "policy_update_count": self.flow_update_count,
+                            "critic_update_interval": max(1, int(getattr(self.argus, "online_critic_update_interval", 1))),
+                            "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
+                            "deploy_flow_allowed": float(self._deploy_flow_allowed()),
+                            "deploy_train_flow_prob": self._train_flow_deploy_prob(),
+                            "online_action_noise_std_current": self._current_action_noise_std(),
+                        }
+                    train_stats.update(rollout_policy_stats)
 
-                for _ in range(num_updates_per_epoch):
                     loss = self._train_step(epoch)
                     if self.wandb_log and self.step % self.wandb_log_frequency == 0:
                         wandb.log(self._compact_train_metrics(train_stats, loss), step=self.step)

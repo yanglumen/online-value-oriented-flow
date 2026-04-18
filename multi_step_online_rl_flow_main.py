@@ -36,6 +36,7 @@ online_multistep_rl_flow_parameters = {
     "batch_size": 512,
     "divergence_coef": 3.0,
     "adv_batch_norm": True,
+    "online_critic_update_interval": 20,
     "multi_mode_action_evaluation": False,
     "online_action_noise_std": 0.5,
     "online_action_noise_clip": 1.0,
