@@ -36,7 +36,7 @@ online_multistep_rl_flow_parameters = {
     "batch_size": 512,
     "divergence_coef": 3.0,
     "adv_batch_norm": True,
-    "online_critic_update_interval": 20,
+    "online_critic_update_interval": 1,
     "multi_mode_action_evaluation": False,
     "online_action_noise_std": 0.5,
     "online_action_noise_clip": 1.0,
@@ -71,6 +71,7 @@ online_multistep_rl_flow_parameters = {
     "online_epochs": 100,
     "online_rollout_steps_per_epoch": 1000,
     "online_updates_per_epoch": 1000,
+    "online_update_mode": "epoch",
     "online_init_steps": 5000,
     "online_random_steps": 5000,
     "online_eval_freq": 5000,
@@ -143,6 +144,8 @@ def hyperparameter_finetuning(argus):
         )
     if not (argus.online_eval_deterministic or argus.online_eval_stochastic):
         raise ValueError("At least one online eval mode must be enabled.")
+    if argus.online_update_mode not in {"epoch", "step"}:
+        raise ValueError("online_update_mode must be one of {'epoch', 'step'}.")
     if argus.critic_type != CriticType.iql:
         raise ValueError(
             "The online entrypoint is now standardized to critic_type='iql'."

@@ -11,7 +11,10 @@ from datasets_process.dataset_util import load_environment, get_environment_info
 
 
 Batch = namedtuple('Batch', 'trajectories conditions observations actions rewards next_observations returns dones')
-OnlineBatch = namedtuple('Batch', 'trajectories conditions observations actions action_log_probs rewards next_observations returns dones')
+OnlineBatch = namedtuple(
+    'Batch',
+    'trajectories conditions observations actions policy_actions action_log_probs rewards next_observations returns dones',
+)
 TaskCondBatch = namedtuple('TaskCondBatch', 'trajectories conditions task_identity observations actions rewards next_observations returns dones')
 ContextBatch = namedtuple('ContextBatch', 'trajectories conditions observations actions')
 ValueBatch = namedtuple('ValueBatch', 'trajectories conditions observations actions next_observations rewards dones returns')
@@ -49,8 +52,16 @@ class OnlineSequenceDataset():
     def get_data_from_dataset(self):
         replay_buffer = OnlineReturnReplayBuffer(
             argus=self.argus, termination_penalty=self.termination_penalty, discounts=self.discount, max_path_length=self.max_path_length,
-            buffer_keys=["observations", "actions", "log_probs", "rewards", "next_observations", "dones", "terminals"],
-            normalize_keys={"observations": self.observation_dim, "actions": self.action_dim, "next_observations": self.observation_dim}
+            buffer_keys=[
+                "observations", "actions", "policy_actions", "log_probs", "rewards",
+                "next_observations", "dones", "terminals",
+            ],
+            normalize_keys={
+                "observations": self.observation_dim,
+                "actions": self.action_dim,
+                "policy_actions": self.action_dim,
+                "next_observations": self.observation_dim,
+            }
         )
         replay_buffer.__setattr__("observation_dim", self.observation_dim)
         replay_buffer.__setattr__("action_dim", self.action_dim)
@@ -123,12 +134,13 @@ class OnlineSequenceDataset():
 
     def sample_trajectories(self, batch_size, indices_type):
         sample_idxs = random.sample(range(self.__len__(indices_type)), batch_size)
-        observations, next_observations, actions, actions_log_probs, rewards, returns, dones = [], [], [], [], [], [], []
+        observations, next_observations, actions, policy_actions, actions_log_probs, rewards, returns, dones = [], [], [], [], [], [], [], []
         for idx in sample_idxs:
-            obs, next_obs, act, act_log_probs, rew, ret, don = self.__getitem__(idx, indices_type=indices_type)
+            obs, next_obs, act, policy_act, act_log_probs, rew, ret, don = self.__getitem__(idx, indices_type=indices_type)
             observations.append(np.expand_dims(obs, axis=0))
             next_observations.append(np.expand_dims(next_obs, axis=0))
             actions.append(np.expand_dims(act, axis=0))
+            policy_actions.append(np.expand_dims(policy_act, axis=0))
             actions_log_probs.append(np.expand_dims(act_log_probs, axis=0))
             rewards.append(np.expand_dims(rew, axis=0))
             returns.append(np.expand_dims(ret, axis=0))
@@ -140,6 +152,7 @@ class OnlineSequenceDataset():
             self.history_observation_range[0] = np.min(observations)
         next_observations = np.vstack(next_observations)
         actions = np.vstack(actions)
+        policy_actions = np.vstack(policy_actions)
         actions_log_probs = np.vstack(actions_log_probs)
         rewards = np.vstack(rewards)
         returns = np.vstack(returns)
@@ -148,7 +161,10 @@ class OnlineSequenceDataset():
         dones = np.vstack(dones)
         trajectories = np.concatenate([observations, actions], axis=-1)
         conditions = self.get_conditions(observations)
-        batch = OnlineBatch(trajectories, conditions, observations, actions, actions_log_probs, rewards, next_observations, returns, dones)
+        batch = OnlineBatch(
+            trajectories, conditions, observations, actions, policy_actions,
+            actions_log_probs, rewards, next_observations, returns, dones,
+        )
         return batch
 
     def __len__(self, indices_type="diffusion"):
@@ -170,6 +186,10 @@ class OnlineSequenceDataset():
         observations = self.replay_buffer.observations[path_ind][start:end]
         next_observations = self.replay_buffer.next_observations[path_ind][start:end]
         actions = self.replay_buffer.actions[path_ind][start:end]
+        if hasattr(self.replay_buffer, "policy_actions") and len(self.replay_buffer.policy_actions) > path_ind:
+            policy_actions = self.replay_buffer.policy_actions[path_ind][start:end]
+        else:
+            policy_actions = actions
         action_log_probs = self.replay_buffer.log_probs[path_ind][start:end]
         rewards = self.replay_buffer.rewards[path_ind][start:end] / self.argus.reward_scale
         returns = self.replay_buffer.discounted_returns[path_ind][start] / self.argus.returns_scale
@@ -178,7 +198,7 @@ class OnlineSequenceDataset():
             observations = self.normalizer.normalize(observations, "observations")
             next_observations = self.normalizer.normalize(next_observations, "observations")
             # actions = self.normalizer.normalize(actions, "actions")
-        return observations, next_observations, actions, action_log_probs, rewards, returns, dones
+        return observations, next_observations, actions, policy_actions, action_log_probs, rewards, returns, dones
 
 class DiffusionValueBasedSequenceDataset(torch.utils.data.Dataset):
     def __init__(self, argus=None, project_path=None, task_idx=4, env_name='ant_dir', sequence_length=64,

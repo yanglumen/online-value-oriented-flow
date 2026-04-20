@@ -80,6 +80,7 @@ class online_guided_flow_trainer(object):
         self.flow_update_count = 0
         self.train_flow_initialized_from_behavior = False
         self.env_step = 0
+        self.rollout_steps_per_epoch = int(getattr(argus, "online_rollout_steps_per_epoch", 1))
         self.save_path = argus.save_path
         self.save_freq = argus.save_freq
         self.env_name = argus.dataset
@@ -149,11 +150,17 @@ class online_guided_flow_trainer(object):
             "rollout_policy_random_frac",
             "rollout_policy_behavior_frac",
             "rollout_policy_train_flow_frac",
+            "rollout_action_noise_l2_mean",
+            "rollout_action_noise_l2_max",
             "deploy_flow_allowed",
             "deploy_train_flow_prob",
             "online_action_noise_std_current",
             "policy_update_count",
             "critic_update_interval",
+            "critic_updated",
+            "online_update_mode",
+            "flow_training_allowed",
+            "flow_start_env_step",
         ]:
             if key in train_stats:
                 metrics[key] = train_stats[key]
@@ -176,6 +183,8 @@ class online_guided_flow_trainer(object):
             "critic_behavior_action_q_mean",
             "critic_train_minus_behavior_q_mean",
             "critic_updated",
+            "train_action_noise_l2_mean",
+            "train_action_noise_l2_max",
         ]:
             if key in loss:
                 metrics[key] = loss[key]
@@ -225,6 +234,8 @@ class online_guided_flow_trainer(object):
             parts.append(f"RolloutLen {train_stats['online_rollout_length']:.1f}")
         if "flow_update_count" in train_stats:
             parts.append(f"FlowUpdates {int(train_stats['flow_update_count'])}")
+        if "critic_updated" in loss:
+            parts.append(f"CriticUpdated {int(loss['critic_updated'])}")
         if "critic_update_interval" in train_stats:
             parts.append(f"CriticEvery {int(train_stats['critic_update_interval'])}")
         if "train_flow_initialized_from_behavior" in train_stats:
@@ -233,6 +244,8 @@ class online_guided_flow_trainer(object):
             parts.append(f"Policy {train_stats.get('rollout_policy_type', self._policy_id_to_type(train_stats['rollout_policy_id']))}")
         if "deploy_train_flow_prob" in train_stats:
             parts.append(f"TrainProb {train_stats['deploy_train_flow_prob']:.3f}")
+        if "rollout_action_noise_l2_mean" in train_stats:
+            parts.append(f"NoiseL2 {train_stats['rollout_action_noise_l2_mean']:.3f}")
         if loss:
             parts.extend([
                 self._metric_str(loss, "q0_loss"),
@@ -242,6 +255,7 @@ class online_guided_flow_trainer(object):
                 self._metric_str(loss, "flow_v_value_loss"),
                 self._metric_str(loss, "flow_divergence"),
                 self._metric_str(loss, "flow_loss"),
+                self._metric_str(loss, "train_action_noise_l2_mean"),
                 self._metric_str(loss, "flow_behavior_action_l2_mean"),
                 self._metric_str(loss, "critic_train_minus_behavior_q_mean"),
             ])
@@ -274,6 +288,7 @@ class online_guided_flow_trainer(object):
         return {
             "observations": [],
             "actions": [],
+            "policy_actions": [],
             "log_probs": [],
             "rewards": [],
             "next_observations": [],
@@ -324,10 +339,16 @@ class online_guided_flow_trainer(object):
         return max(1, int(self.argus.online_updates_per_epoch))
 
     def _should_use_random_policy(self):
-        return self.env_step < self.argus.online_random_steps or self.step < self._behavior_bootstrap_updates()
+        return self.env_step < self.argus.online_random_steps
 
-    def _flow_time_gate_open(self):
-        return self.step >= self.argus.update_flow_start_epoch * max(1, self.argus.online_updates_per_epoch)
+    def _flow_start_env_step(self):
+        return int(self.argus.update_flow_start_epoch) * max(1, int(self.rollout_steps_per_epoch))
+
+    def _flow_training_allowed(self):
+        return self.env_step >= self._flow_start_env_step()
+
+    def _behavior_bootstrap_complete(self):
+        return self.flow_update_count >= self._behavior_bootstrap_updates()
 
     def _deploy_flow_allowed(self):
         if self.argus.online_behavior_only:
@@ -336,10 +357,11 @@ class online_guided_flow_trainer(object):
             return False
         deploy_after_updates = int(getattr(self.argus, "online_deploy_flow_after_updates", 0))
         deploy_after_epoch = int(getattr(self.argus, "online_deploy_flow_after_epoch", 0))
-        deploy_after_step = deploy_after_epoch * max(1, self.argus.online_updates_per_epoch)
+        deploy_after_env_step = deploy_after_epoch * max(1, int(self.rollout_steps_per_epoch))
         min_flow_updates = int(getattr(self.argus, "online_min_flow_updates_before_deploy", 1))
         return (
-            self.step >= deploy_after_step
+            self.env_step >= deploy_after_env_step
+            and self._behavior_bootstrap_complete()
             and self.flow_update_count >= deploy_after_updates
             and self.flow_update_count >= min_flow_updates
         )
@@ -487,31 +509,52 @@ class online_guided_flow_trainer(object):
         if self._should_use_random_policy():
             action = self.collect_env.action_space.sample()
             self.prev_action = to_torch(np.asarray(action, dtype=np.float32)[None], device=self.argus.device)
-            return np.asarray(action, dtype=np.float32), 0.0, 0
+            action = np.asarray(action, dtype=np.float32)
+            return action, action, 0.0, 0
 
         obs_batch = np.asarray(obs, dtype=np.float32)[None]
         if self.argus.train_with_normed_data:
             obs_batch = self.dataset.normalizer.normalize(obs_batch, "observations")
         obs_tensor = to_torch(obs_batch, device=self.argus.device)
-        action_tensor, policy_id = self._sample_policy_tensor(
+        clean_action_tensor, policy_id = self._sample_policy_tensor(
             obs_tensor, self.prev_action, deterministic=False, return_policy_id=True)
-        action_tensor = self._apply_training_action_noise(action_tensor)
-        self.prev_action = action_tensor.detach()
-        return to_np(action_tensor.squeeze(0)).astype(np.float32), 0.0, policy_id
+        executed_action_tensor = self._apply_training_action_noise(clean_action_tensor)
+        if getattr(self.argus, "online_action_noise_enable", False):
+            if clean_action_tensor.shape != executed_action_tensor.shape:
+                raise RuntimeError(
+                    "Clean policy action and executed env action shape mismatch: "
+                    f"{clean_action_tensor.shape} vs {executed_action_tensor.shape}"
+                )
+        self.prev_action = executed_action_tensor.detach()
+        return (
+            to_np(clean_action_tensor.squeeze(0)).astype(np.float32),
+            to_np(executed_action_tensor.squeeze(0)).astype(np.float32),
+            0.0,
+            policy_id,
+        )
 
     def collect_rollouts(self, rollout_steps):
         episode_returns = []
         episode_lengths = []
         policy_counts = {0: 0, 1: 0, 2: 0}
+        noise_l2_values = []
         for _ in range(rollout_steps):
-            action, log_prob, policy_id = self._policy_action(self.collect_obs)
+            policy_action, env_action, log_prob, policy_id = self._policy_action(self.collect_obs)
             policy_counts[policy_id] = policy_counts.get(policy_id, 0) + 1
-            next_obs, reward, terminated, truncated, _ = self._step_env(self.collect_env, action)
+            action_noise_l2 = float(np.linalg.norm(env_action - policy_action))
+            if not getattr(self.argus, "online_action_noise_enable", False) and action_noise_l2 > 1e-6:
+                raise RuntimeError(
+                    "Expected clean policy action and executed env action to match "
+                    f"when online_action_noise_enable=False, got L2={action_noise_l2:.6g}."
+                )
+            noise_l2_values.append(action_noise_l2)
+            next_obs, reward, terminated, truncated, _ = self._step_env(self.collect_env, env_action)
             self.current_episode_steps += 1
             timed_out = truncated or self.current_episode_steps >= self.collect_env.max_episode_steps
             episode_done = terminated or timed_out
             self.current_path["observations"].append(np.asarray(self.collect_obs, dtype=np.float32))
-            self.current_path["actions"].append(np.asarray(action, dtype=np.float32))
+            self.current_path["actions"].append(np.asarray(env_action, dtype=np.float32))
+            self.current_path["policy_actions"].append(np.asarray(policy_action, dtype=np.float32))
             self.current_path["log_probs"].append(np.asarray([log_prob], dtype=np.float32))
             self.current_path["rewards"].append(np.asarray([reward], dtype=np.float32))
             self.current_path["next_observations"].append(np.asarray(next_obs, dtype=np.float32))
@@ -532,7 +575,11 @@ class online_guided_flow_trainer(object):
                 self.prev_action = torch.zeros((1, self.argus.action_dim), device=self.argus.device)
                 self.current_path = self._empty_path()
                 self.current_episode_steps = 0
-        return episode_returns, episode_lengths, self._rollout_policy_stats(policy_counts, rollout_steps)
+        rollout_policy_stats = self._rollout_policy_stats(policy_counts, rollout_steps)
+        if noise_l2_values:
+            rollout_policy_stats["rollout_action_noise_l2_mean"] = float(np.mean(noise_l2_values))
+            rollout_policy_stats["rollout_action_noise_l2_max"] = float(np.max(noise_l2_values))
+        return episode_returns, episode_lengths, rollout_policy_stats
 
     def sample_batch(self):
         if self.dataset.__len__(indices_type="ac") < self.argus.batch_size:
@@ -540,18 +587,20 @@ class online_guided_flow_trainer(object):
         batch = self.dataset.sample_trajectories(batch_size=self.argus.batch_size, indices_type="ac")
         return batch_to_device(batch, device=self.device, convert_to_torch_float=True)
 
-    def _train_step(self, epoch):
+    def _train_step(self):
         batch = self.sample_batch()
         if batch is None:
             return {}
         observation_seq = batch.observations
-        action_seq = batch.actions
+        env_action_seq = batch.actions
+        policy_action_seq = getattr(batch, "policy_actions", env_action_seq)
         next_observation_seq = batch.next_observations
         reward_seq = batch.rewards
         done_seq = batch.dones
 
         observations = observation_seq.reshape(-1, self.argus.observation_dim)
-        actions = action_seq.reshape(-1, self.argus.action_dim)
+        env_actions = env_action_seq.reshape(-1, self.argus.action_dim)
+        policy_actions = policy_action_seq.reshape(-1, self.argus.action_dim)
         next_observations = next_observation_seq.reshape(-1, self.argus.observation_dim)
         rewards = reward_seq.reshape(-1, 1)
         dones = done_seq.reshape(-1, 1)
@@ -560,9 +609,9 @@ class online_guided_flow_trainer(object):
         # TODO(online/offline): Online still builds transition batches with a done
         # mask from sequence replay, while offline adv training uses adjacent rows.
         transition_observations = observation_seq[:, :-1].reshape(-1, self.argus.observation_dim)[valid_next_mask]
-        transition_actions = action_seq[:, :-1].reshape(-1, self.argus.action_dim)[valid_next_mask]
+        transition_policy_actions = policy_action_seq[:, :-1].reshape(-1, self.argus.action_dim)[valid_next_mask]
         transition_next_observations = next_observation_seq[:, :-1].reshape(-1, self.argus.observation_dim)[valid_next_mask]
-        transition_next_actions = action_seq[:, 1:].reshape(-1, self.argus.action_dim)[valid_next_mask]
+        transition_next_policy_actions = policy_action_seq[:, 1:].reshape(-1, self.argus.action_dim)[valid_next_mask]
         if self.argus.debug_mode:
             update_energy = True
             update_behavior = True
@@ -570,7 +619,7 @@ class online_guided_flow_trainer(object):
         else:
             update_energy = True
             update_behavior = True
-            update_flow = epoch >= self.argus.update_flow_start_epoch
+            update_flow = self._flow_training_allowed()
         if self.argus.online_behavior_only:
             # TODO(online/offline): Behavior-only is an online deployment baseline,
             # not a shared offline learning-mode semantic.
@@ -588,120 +637,156 @@ class online_guided_flow_trainer(object):
             or self.argus.rl_mode != RLTrainMode.adv_rl
             or (
                 adv_policy_step_available
-                and self.flow_update_count % critic_update_interval == 0
+                and self.step % critic_update_interval == 0
             )
         )
+        update_adv_policy = adv_policy_step_available and update_adv_critic
         if update_energy and self.argus.rl_mode == RLTrainMode.adv_rl:
             update_energy = update_adv_critic
         loss = {}
         if update_energy:
             loss.update(self.energy_train(
-                iql_tau=self.argus.iql_tau, observations=observations, actions=actions,
+                iql_tau=self.argus.iql_tau, observations=observations, actions=env_actions,
                 next_observations=next_observations, rewards=rewards, dones=dones))
         if update_behavior:
-            loss.update(self.behavior_flow_train(observations=observations, actions=actions))
+            loss.update(self.behavior_flow_train(observations=observations, actions=policy_actions))
         if update_flow:
             self._maybe_init_train_flow_from_behavior()
             # TODO(online/offline): Flow deployment/init gating remains online-only;
             # only the learning step below is shared.
             if self.argus.rl_mode == RLTrainMode.use_rl_q:
-                loss.update(self.flow_train(observations=observations, actions=actions))
+                loss.update(self.flow_train(observations=observations, actions=policy_actions))
             elif self.argus.rl_mode == RLTrainMode.adv_rl:
-                if transition_observations.shape[0] > 0:
+                if update_adv_policy:
                     if update_adv_critic:
                         loss.update(self.adv_based_value_train(
-                            observations=transition_observations, actions=transition_actions))
+                            observations=transition_observations, actions=transition_policy_actions))
                     loss.update(self.adv_based_policy_train(
-                        observations=transition_observations, actions=transition_actions))
+                        observations=transition_observations, actions=transition_policy_actions))
                     loss["critic_updated"] = float(update_adv_critic)
                     self.flow_update_count += 1
             elif self.argus.rl_mode == RLTrainMode.grpo:
                 if transition_observations.shape[0] > 0:
                     loss.update(self.grpo_value_train(
-                        observations=transition_observations, actions=transition_actions))
+                        observations=transition_observations, actions=transition_policy_actions))
                     loss.update(self.grpo_policy_train(
-                        observations=transition_observations, actions=transition_actions,
-                        next_observations=transition_next_observations, next_actions=transition_next_actions,
+                        observations=transition_observations, actions=transition_policy_actions,
+                        next_observations=transition_next_observations, next_actions=transition_next_policy_actions,
                         expectile=self.argus.gfpo_expectile))
                     self.flow_update_count += 1
             elif self.argus.rl_mode == RLTrainMode.direct_flow_2_result:
                 loss.update(self.direct_flow2result_value_train(
-                    observations=observations, actions=actions, next_observations=next_observations, rewards=rewards, dones=dones))
-                loss.update(self.direct_flow2result_policy_train(observations=observations, actions=actions))
+                    observations=observations, actions=env_actions, next_observations=next_observations, rewards=rewards, dones=dones))
+                loss.update(self.direct_flow2result_policy_train(observations=observations, actions=policy_actions))
             elif self.argus.rl_mode == RLTrainMode.full_rl_like:
                 loss.update(self.full_rl_like_value_train(
-                    observations=observations, actions=actions, next_observations=next_observations, rewards=rewards, dones=dones))
-                loss.update(self.full_rl_like_policy_train(observations=observations, actions=actions))
+                    observations=observations, actions=env_actions, next_observations=next_observations, rewards=rewards, dones=dones))
+                loss.update(self.full_rl_like_policy_train(observations=observations, actions=policy_actions))
             elif self.argus.rl_mode in [RLTrainMode.flow_constrained_rl, RLTrainMode.flow_constrained_rl2, RLTrainMode.flow_constrained_rl3, RLTrainMode.flow_constrained_rl4, RLTrainMode.flow_constrained_rl5]:
                 loss.update(self.flow_constrained_value_train(
-                    observations=observations, actions=actions, next_observations=next_observations, rewards=rewards, dones=dones))
+                    observations=observations, actions=env_actions, next_observations=next_observations, rewards=rewards, dones=dones))
                 if transition_observations.shape[0] > 0:
                     loss.update(self.flow_constrained_policy_train(
-                        observations=transition_observations, actions=transition_actions,
-                        next_observations=transition_next_observations, next_actions=transition_next_actions))
+                        observations=transition_observations, actions=transition_policy_actions,
+                        next_observations=transition_next_observations, next_actions=transition_next_policy_actions))
             else:
                 raise NotImplementedError(f"Unsupported online rl_mode: {self.argus.rl_mode}")
+        if "critic_updated" not in loss:
+            loss["critic_updated"] = float(update_energy)
+        if getattr(self.argus, "online_action_noise_enable", False):
+            action_noise_l2 = torch.norm(env_actions - policy_actions, dim=-1)
+            loss["train_action_noise_l2_mean"] = action_noise_l2.mean().detach().cpu().numpy().item()
+            loss["train_action_noise_l2_max"] = action_noise_l2.max().detach().cpu().numpy().item()
         loss.update(self._policy_diagnostics(observations=observations))
         return loss
 
+    def _make_train_stats(self, rollout_returns=None, rollout_lengths=None, rollout_policy_stats=None):
+        train_stats = {
+            "env_step": self.env_step,
+            "replay_episodes": self.dataset.replay_buffer.n_episodes,
+            "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
+            "flow_update_count": self.flow_update_count,
+            "policy_update_count": self.flow_update_count,
+            "critic_update_interval": max(1, int(getattr(self.argus, "online_critic_update_interval", 1))),
+            "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
+            "deploy_flow_allowed": float(self._deploy_flow_allowed()),
+            "deploy_train_flow_prob": self._train_flow_deploy_prob(),
+            "online_action_noise_std_current": self._current_action_noise_std(),
+            "online_update_mode": getattr(self.argus, "online_update_mode", "epoch"),
+            "flow_training_allowed": float(self._flow_training_allowed()),
+            "flow_start_env_step": self._flow_start_env_step(),
+        }
+        if rollout_returns:
+            train_stats["online_rollout_return"] = float(np.mean(rollout_returns))
+            train_stats["online_rollout_length"] = float(np.mean(rollout_lengths))
+        if rollout_policy_stats:
+            train_stats.update(rollout_policy_stats)
+        return train_stats
+
+    def _after_train_step(self, epoch, train_stats, loss, last_log_time):
+        if self.wandb_log and self.step % self.wandb_log_frequency == 0:
+            wandb.log(self._compact_train_metrics(train_stats, loss), step=self.step)
+        if self.step > 0 and self.step % self.argus.online_eval_freq == 0:
+            self.eval_online()
+        if self.step > 0 and self.step % self.save_freq == 0:
+            self.save_critic_checpoint()
+        if self.step % self.online_print_frequency == 0:
+            print(self._format_train_summary(epoch, train_stats, loss, time.time() - last_log_time))
+            last_log_time = time.time()
+        self.step += 1
+        return last_log_time
+
     def online_train(self, num_epochs, rollout_steps_per_epoch, num_updates_per_epoch):
         try:
-            if int(num_updates_per_epoch) != int(rollout_steps_per_epoch):
-                print(
-                    "Using one online update per environment step; "
-                    f"overriding online_updates_per_epoch={num_updates_per_epoch} "
-                    f"with rollout_steps_per_epoch={rollout_steps_per_epoch}."
-                )
-                num_updates_per_epoch = rollout_steps_per_epoch
-                self.argus.online_updates_per_epoch = rollout_steps_per_epoch
+            rollout_steps_per_epoch = int(rollout_steps_per_epoch)
+            num_updates_per_epoch = int(num_updates_per_epoch)
+            self.rollout_steps_per_epoch = rollout_steps_per_epoch
+            self.argus.online_rollout_steps_per_epoch = rollout_steps_per_epoch
+            self.argus.online_updates_per_epoch = num_updates_per_epoch
+            online_update_mode = getattr(self.argus, "online_update_mode", "epoch")
+            if online_update_mode not in {"epoch", "step"}:
+                raise ValueError(f"Unsupported online_update_mode={online_update_mode!r}; expected 'epoch' or 'step'.")
             warmup_steps = max(self.argus.online_init_steps, self.argus.batch_size)
             if self.dataset.__len__(indices_type="ac") < warmup_steps:
                 self.collect_rollouts(warmup_steps)
             last_log_time = time.time()
             for epoch in range(num_epochs):
-                for _ in range(rollout_steps_per_epoch):
-                    rollout_returns, rollout_lengths, rollout_policy_stats = self.collect_rollouts(1)
-                    if rollout_returns:
-                        train_stats = {
-                            "online_rollout_return": float(np.mean(rollout_returns)),
-                            "online_rollout_length": float(np.mean(rollout_lengths)),
-                            "env_step": self.env_step,
-                            "replay_episodes": self.dataset.replay_buffer.n_episodes,
-                            "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
-                            "flow_update_count": self.flow_update_count,
-                            "policy_update_count": self.flow_update_count,
-                            "critic_update_interval": max(1, int(getattr(self.argus, "online_critic_update_interval", 1))),
-                            "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
-                            "deploy_flow_allowed": float(self._deploy_flow_allowed()),
-                            "deploy_train_flow_prob": self._train_flow_deploy_prob(),
-                            "online_action_noise_std_current": self._current_action_noise_std(),
-                        }
-                    else:
-                        train_stats = {
-                            "env_step": self.env_step,
-                            "replay_episodes": self.dataset.replay_buffer.n_episodes,
-                            "replay_steps": int(np.sum(self.dataset.replay_buffer.path_lengths)),
-                            "flow_update_count": self.flow_update_count,
-                            "policy_update_count": self.flow_update_count,
-                            "critic_update_interval": max(1, int(getattr(self.argus, "online_critic_update_interval", 1))),
-                            "train_flow_initialized_from_behavior": float(self.train_flow_initialized_from_behavior),
-                            "deploy_flow_allowed": float(self._deploy_flow_allowed()),
-                            "deploy_train_flow_prob": self._train_flow_deploy_prob(),
-                            "online_action_noise_std_current": self._current_action_noise_std(),
-                        }
-                    train_stats.update(rollout_policy_stats)
-
-                    loss = self._train_step(epoch)
-                    if self.wandb_log and self.step % self.wandb_log_frequency == 0:
-                        wandb.log(self._compact_train_metrics(train_stats, loss), step=self.step)
-                    if self.step > 0 and self.step % self.argus.online_eval_freq == 0:
-                        self.eval_online()
-                    if self.step > 0 and self.step % self.save_freq == 0:
-                        self.save_critic_checpoint()
-                    if self.step % self.online_print_frequency == 0:
-                        print(self._format_train_summary(epoch, train_stats, loss, time.time() - last_log_time))
-                        last_log_time = time.time()
-                    self.step += 1
+                if online_update_mode == "epoch":
+                    rollout_returns, rollout_lengths, rollout_policy_stats = self.collect_rollouts(rollout_steps_per_epoch)
+                    train_stats = self._make_train_stats(
+                        rollout_returns=rollout_returns,
+                        rollout_lengths=rollout_lengths,
+                        rollout_policy_stats=rollout_policy_stats,
+                    )
+                    for _ in range(num_updates_per_epoch):
+                        loss = self._train_step()
+                        train_stats["flow_update_count"] = self.flow_update_count
+                        train_stats["policy_update_count"] = self.flow_update_count
+                        train_stats["train_flow_initialized_from_behavior"] = float(self.train_flow_initialized_from_behavior)
+                        train_stats["deploy_flow_allowed"] = float(self._deploy_flow_allowed())
+                        train_stats["deploy_train_flow_prob"] = self._train_flow_deploy_prob()
+                        train_stats["flow_training_allowed"] = float(self._flow_training_allowed())
+                        last_log_time = self._after_train_step(epoch, train_stats, loss, last_log_time)
+                else:
+                    updates_completed = 0
+                    for rollout_idx in range(rollout_steps_per_epoch):
+                        rollout_returns, rollout_lengths, rollout_policy_stats = self.collect_rollouts(1)
+                        target_updates = int(np.floor((rollout_idx + 1) * num_updates_per_epoch / max(1, rollout_steps_per_epoch)))
+                        while updates_completed < target_updates:
+                            train_stats = self._make_train_stats(
+                                rollout_returns=rollout_returns,
+                                rollout_lengths=rollout_lengths,
+                                rollout_policy_stats=rollout_policy_stats,
+                            )
+                            loss = self._train_step()
+                            train_stats["flow_update_count"] = self.flow_update_count
+                            train_stats["policy_update_count"] = self.flow_update_count
+                            train_stats["train_flow_initialized_from_behavior"] = float(self.train_flow_initialized_from_behavior)
+                            train_stats["deploy_flow_allowed"] = float(self._deploy_flow_allowed())
+                            train_stats["deploy_train_flow_prob"] = self._train_flow_deploy_prob()
+                            train_stats["flow_training_allowed"] = float(self._flow_training_allowed())
+                            last_log_time = self._after_train_step(epoch, train_stats, loss, last_log_time)
+                            updates_completed += 1
         finally:
             if self.wandb_log and wandb.run is not None:
                 wandb.finish()
@@ -838,7 +923,7 @@ class online_guided_flow_trainer(object):
         Q = self.flow_energy_model.q(x=torch.cat([observations, x_t, dx_dt], dim=-1), t=t)
         conservative_q_loss = torch.logsumexp(
             self.flow_energy_model.q(x=torch.cat([observations, noise_x_t, noise_dxdt], dim=-1), t=t), dim=0) - Q.mean()
-        normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True)
+        normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True).clamp_min(1e-6)
         V = self.flow_energy_model.v(x=torch.cat([observations, x_t, normed_dx_dt], dim=-1), t=t)
         with torch.no_grad():
             target_fv = self.energy_model.get_scaled_q(obs=observations, act=actions, scale=self.argus.energy_scale)
@@ -872,7 +957,7 @@ class online_guided_flow_trainer(object):
             behavior_u = self.behavior_flow(x=torch.cat([observations, x_t], dim=-1), t=t)
         cos_sim = torch.nn.functional.cosine_similarity(pred_u, behavior_u.detach(), dim=-1)
         divergence = 1 - cos_sim.unsqueeze(dim=-1)
-        normed_pred_u = pred_u / torch.norm(pred_u, dim=-1, keepdim=True)
+        normed_pred_u = pred_u / torch.norm(pred_u, dim=-1, keepdim=True).clamp_min(1e-6)
         pred_Q = self.flow_energy_model.q_target(x=torch.cat([observations, x_t, pred_u], dim=-1), t=t)
         pred_V = self.flow_energy_model.v(x=torch.cat([observations, x_t, normed_pred_u], dim=-1), t=t)
         loss = -(pred_Q - pred_V)
@@ -1010,7 +1095,7 @@ class online_guided_flow_trainer(object):
         x_t = x_t + pred_u * dt
         next_pred_u = self.model(x=torch.cat([observations, x_t.detach()], dim=-1), t=t + dt)
         direction_consistency = torch.norm(
-            pred_u / torch.norm(pred_u, dim=-1, keepdim=True) - next_pred_u / torch.norm(next_pred_u, dim=-1, keepdim=True),
+            pred_u / torch.norm(pred_u, dim=-1, keepdim=True).clamp_min(1e-6) - next_pred_u / torch.norm(next_pred_u, dim=-1, keepdim=True).clamp_min(1e-6),
             dim=-1, keepdim=True)
         x = torch.randn(num_samples, self.argus.action_dim, device=self.argus.device).clamp(-self.argus.x_t_clip_value, self.argus.x_t_clip_value)
         time_start, time_end, steps = 0, 1.0, self.argus.direct_flow_step
@@ -1084,11 +1169,11 @@ class online_guided_flow_trainer(object):
         with torch.no_grad():
             behavior_u = self.behavior_flow(x=torch.cat([observations, x_t], dim=-1), t=t)
             behavior_u = behavior_u.clamp(-self.argus.x_t_clip_value, self.argus.x_t_clip_value)
-            normed_behavior_u = behavior_u / torch.norm(behavior_u, dim=-1, keepdim=True)
+            normed_behavior_u = behavior_u / torch.norm(behavior_u, dim=-1, keepdim=True).clamp_min(1e-6)
             behavior_u_V = self.flow_energy_model.v(x=torch.cat([observations, x_t, normed_behavior_u], dim=-1), t=t)
             target_pred_u = self.target_model(x=torch.cat([observations, x_t], dim=-1), t=t)
             target_pred_u = target_pred_u.clamp(-self.argus.x_t_clip_value, self.argus.x_t_clip_value)
-            normed_target_pred_u = target_pred_u / torch.norm(target_pred_u, dim=-1, keepdim=True)
+            normed_target_pred_u = target_pred_u / torch.norm(target_pred_u, dim=-1, keepdim=True).clamp_min(1e-6)
             target_pred_u_V = self.flow_energy_model.v(x=torch.cat([observations, x_t, normed_target_pred_u], dim=-1), t=t)
             Q_bar = torch.max(expectile * behavior_u_V + (1 - expectile) * target_pred_u_V, expectile * target_pred_u_V + (1 - expectile) * behavior_u_V)
 
@@ -1118,7 +1203,7 @@ class online_guided_flow_trainer(object):
             energy_model=self.energy_model, weighted_samples_type=WeightedSamplesType.linear_interpolation,
             clip_value=self.argus.x_t_clip_value,
         )
-        normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True)
+        normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True).clamp_min(1e-6)
         flow_observations = torch.cat([observations, x_t], dim=-1)
         flow_next_observations = torch.cat([next_observations, x_t], dim=-1)
         Q_loss, V_loss, loss_info = self.flow_energy_model.loss(
@@ -1149,7 +1234,7 @@ class online_guided_flow_trainer(object):
             behavior_u = self.behavior_flow(x=torch.cat([observations, x_t], dim=-1), t=t)
         cos_sim = torch.nn.functional.cosine_similarity(pred_u, behavior_u.detach(), dim=-1)
         divergence = 1 - cos_sim.unsqueeze(dim=-1)
-        normed_pred_u = pred_u / torch.norm(pred_u, dim=-1, keepdim=True)
+        normed_pred_u = pred_u / torch.norm(pred_u, dim=-1, keepdim=True).clamp_min(1e-6)
         pred_Q = self.flow_energy_model.q_target(x=torch.cat([observations, x_t, pred_u], dim=-1), t=t)
         pred_V = self.flow_energy_model.v(x=torch.cat([observations, x_t, normed_pred_u], dim=-1), t=t)
         loss = -(pred_Q - pred_V)

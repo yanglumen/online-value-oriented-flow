@@ -138,7 +138,7 @@ class iql_flow_critic(nn.Module):
         self.ema = EMA(args.ema_decay)
 
     def get_adv(self, observations, x_t, dx_dt, t):
-        normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True)
+        normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True).clamp_min(1e-6)
         Q = self.q(x=torch.cat([observations, x_t, dx_dt], dim=-1), t=t)
         V = self.v(x=torch.cat([observations, x_t, normed_dx_dt], dim=-1), t=t)
         return Q-V
@@ -226,7 +226,7 @@ class adv_decision_flow_iql_flow_critic(nn.Module):
         self.ema = EMA(args.ema_decay)
 
     def get_adv(self, observations, x_t, dx_dt, t):
-        normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True)
+        normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True).clamp_min(1e-6)
         Q = self.q(x=torch.cat([observations, x_t, dx_dt], dim=-1), t=t)
         V = self.v(x=torch.cat([observations, x_t, normed_dx_dt], dim=-1), t=t)
         return Q-V

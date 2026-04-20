@@ -9,10 +9,13 @@ DOMAIN="${DOMAIN:-gymnasium}"
 CRITIC_TYPE="${CRITIC_TYPE:-iql}"
 RUN_TAG="${RUN_TAG:-swdg_w4_s1_n8}"
 SEED="${SEED:-1}"
+MAIN_GPU_POOL="${MAIN_GPU_POOL:-0 1}"
+BASELINE_GPU_POOL="${BASELINE_GPU_POOL:-2 3}"
 
 ONLINE_EPOCHS="${ONLINE_EPOCHS:-1000}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-1000}"
-UPDATE_STEPS="${UPDATE_STEPS:-$ROLLOUT_STEPS}"
+UPDATE_STEPS="${UPDATE_STEPS:-1000}"
+ONLINE_UPDATE_MODE="${ONLINE_UPDATE_MODE:-epoch}"
 INIT_STEPS="${INIT_STEPS:-5000}"
 RANDOM_STEPS="${RANDOM_STEPS:-5000}"
 EVAL_FREQ="${EVAL_FREQ:-1000}"
@@ -28,7 +31,7 @@ SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-2}"
 LR="${LR:-0.00005}"
 DIVERGENCE_COEF="${DIVERGENCE_COEF:-3.0}"
 ADV_BATCH_NORM="${ADV_BATCH_NORM:-True}"
-CRITIC_UPDATE_INTERVAL="${CRITIC_UPDATE_INTERVAL:-20}"
+CRITIC_UPDATE_INTERVAL="${CRITIC_UPDATE_INTERVAL:-1}"
 PRESERVE_EP="${PRESERVE_EP:-300}"
 MULTI_MODE_ACTION_EVALUATION="${MULTI_MODE_ACTION_EVALUATION:-False}"
 ONLINE_ACTION_NOISE_ENABLE="${ONLINE_ACTION_NOISE_ENABLE:-True}"
@@ -62,6 +65,30 @@ if (( SEQUENCE_LENGTH < 2 )); then
   exit 1
 fi
 
+validate_gpu_pool() {
+  local pool_name="$1"
+  local pool="$2"
+  local -a gpus=()
+  read -r -a gpus <<< "$pool"
+  if (( ${#gpus[@]} == 0 )); then
+    echo "${pool_name} must contain at least one GPU id." >&2
+    exit 1
+  fi
+}
+
+validate_gpu_pools_do_not_overlap() {
+  local main_gpu
+  local baseline_gpu
+  for main_gpu in $MAIN_GPU_POOL; do
+    for baseline_gpu in $BASELINE_GPU_POOL; do
+      if [[ "$main_gpu" == "$baseline_gpu" ]]; then
+        echo "MAIN_GPU_POOL and BASELINE_GPU_POOL overlap on GPU ${main_gpu}; refusing to oversubscribe." >&2
+        exit 1
+      fi
+    done
+  done
+}
+
 run_experiment() {
   local label="$1"
   local seed="$2"
@@ -94,6 +121,7 @@ run_experiment() {
     --online_epochs "$ONLINE_EPOCHS" \
     --online_rollout_steps_per_epoch "$ROLLOUT_STEPS" \
     --online_updates_per_epoch "$UPDATE_STEPS" \
+    --online_update_mode "$ONLINE_UPDATE_MODE" \
     --online_init_steps "$INIT_STEPS" \
     --online_random_steps "$RANDOM_STEPS" \
     --update_flow_start_epoch "$UPDATE_FLOW_START_EPOCH" \
@@ -131,5 +159,89 @@ run_experiment() {
     --online_gradual_deploy_ramp_updates "$ONLINE_GRADUAL_DEPLOY_RAMP_UPDATES"
 }
 
-run_experiment "adv_rl_swdg" "$SEED" "False"
-run_experiment "behavior_only_swdg" "$SEED" "True"
+wait_for_free_gpu() {
+  local -n wait_pids_ref="$1"
+  local idx
+  while true; do
+    for idx in "${!wait_pids_ref[@]}"; do
+      if [[ -z "${wait_pids_ref[$idx]}" ]]; then
+        FREE_GPU_IDX="$idx"
+        return 0
+      fi
+      if ! kill -0 "${wait_pids_ref[$idx]}" 2>/dev/null; then
+        wait "${wait_pids_ref[$idx]}"
+        wait_pids_ref[$idx]=""
+        FREE_GPU_IDX="$idx"
+        return 0
+      fi
+    done
+    sleep 10
+  done
+}
+
+schedule_experiment_group() {
+  local group="$1"
+  local pool="$2"
+  shift 2
+  local -a gpus=()
+  local -a pids=()
+  local spec
+  local gpu_idx
+  local gpu
+  local label
+  local seed
+  local behavior_only
+  local FREE_GPU_IDX
+
+  read -r -a gpus <<< "$pool"
+  for gpu_idx in "${!gpus[@]}"; do
+    pids[$gpu_idx]=""
+  done
+
+  for spec in "$@"; do
+    IFS='|' read -r label seed behavior_only <<< "$spec"
+    wait_for_free_gpu pids
+    gpu_idx="$FREE_GPU_IDX"
+    gpu="${gpus[$gpu_idx]}"
+    echo "============================================================"
+    echo "Launching group=${group} gpu=${gpu} experiment=${label}_seed${seed}_${RUN_TAG}"
+    echo "============================================================"
+    (
+      export CUDA_VISIBLE_DEVICES="$gpu"
+      run_experiment "$label" "$seed" "$behavior_only"
+    ) &
+    pids[$gpu_idx]="$!"
+  done
+
+  for gpu_idx in "${!pids[@]}"; do
+    if [[ -n "${pids[$gpu_idx]}" ]]; then
+      wait "${pids[$gpu_idx]}"
+      pids[$gpu_idx]=""
+    fi
+  done
+}
+
+validate_gpu_pool "MAIN_GPU_POOL" "$MAIN_GPU_POOL"
+validate_gpu_pool "BASELINE_GPU_POOL" "$BASELINE_GPU_POOL"
+validate_gpu_pools_do_not_overlap
+
+main_experiments=(
+  "adv_rl_swdg|$SEED|False"
+)
+
+baseline_experiments=(
+  "behavior_only_swdg|$SEED|True"
+)
+
+schedule_experiment_group "main" "$MAIN_GPU_POOL" "${main_experiments[@]}" &
+main_scheduler_pid="$!"
+schedule_experiment_group "baseline" "$BASELINE_GPU_POOL" "${baseline_experiments[@]}" &
+baseline_scheduler_pid="$!"
+
+main_status=0
+baseline_status=0
+wait "$main_scheduler_pid" || main_status="$?"
+wait "$baseline_scheduler_pid" || baseline_status="$?"
+if (( main_status != 0 || baseline_status != 0 )); then
+  exit 1
+fi

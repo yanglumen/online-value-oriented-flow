@@ -46,6 +46,7 @@ uv run python multi_step_online_rl_flow_main.py train \
   --online_random_steps "$INIT_STEPS" \
   --online_rollout_steps_per_epoch "$ROLLOUT_STEPS" \
   --online_updates_per_epoch 3 \
+  --online_update_mode epoch \
   --update_flow_start_epoch 0 \
   --online_behavior_bootstrap_updates 0 \
   --online_eval_freq 1 \

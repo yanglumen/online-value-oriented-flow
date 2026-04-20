@@ -109,7 +109,7 @@ def adv_value_update(batch, models, optimizers, config):
         clip_value=config.x_t_clip_value,
     )
     q_value = flow_energy_model.q(x=torch.cat([observations, x_t, dx_dt], dim=-1), t=t)
-    normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True)
+    normed_dx_dt = dx_dt / torch.norm(dx_dt, dim=-1, keepdim=True).clamp_min(1e-6)
     v_value = flow_energy_model.v(x=torch.cat([observations, x_t, normed_dx_dt], dim=-1), t=t)
     with torch.no_grad():
         target_fv = energy_model.get_scaled_q(obs=observations, act=actions, scale=config.energy_scale)
@@ -154,7 +154,7 @@ def adv_policy_update(batch, models, optimizers, config):
     pred_u = flow_model(x=torch.cat([observations, x_t], dim=-1), t=t)
     pred_u = pred_u.clamp(-config.x_t_clip_value, config.x_t_clip_value)
     divergence = F.mse_loss(pred_u, dx_dt)
-    normed_pred_u = pred_u / torch.norm(pred_u, dim=-1, keepdim=True)
+    normed_pred_u = pred_u / torch.norm(pred_u, dim=-1, keepdim=True).clamp_min(1e-6)
     pred_q = flow_energy_model.q(x=torch.cat([observations, x_t, pred_u], dim=-1), t=t)
     pred_v = flow_energy_model.v(x=torch.cat([observations, x_t, normed_pred_u], dim=-1), t=t)
     advantage = pred_q - pred_v.detach()

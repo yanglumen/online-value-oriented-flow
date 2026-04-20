@@ -243,7 +243,7 @@ class sliding_window_iql_critic(nn.Module):
             q_val = self.q.min_member(idx=idx, action=act_var, condition=observations).sum()
             grad = torch.autograd.grad(q_val, act_var, retain_graph=True, create_graph=True)[0]
             grad = grad.reshape(grad.shape[0], -1)
-            grad = grad / (grad.norm(dim=-1, keepdim=True) + 1e-6)
+            grad = grad / grad.norm(dim=-1, keepdim=True).clamp_min(1e-6)
             grads.append(grad)
 
         penalties = []

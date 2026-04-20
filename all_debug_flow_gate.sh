@@ -24,6 +24,7 @@ COMMON_ARGS=(
   --online_epochs "${ONLINE_EPOCHS:-20}"
   --online_rollout_steps_per_epoch "${ROLLOUT_STEPS:-1000}"
   --online_updates_per_epoch "${UPDATE_STEPS:-300}"
+  --online_update_mode "${ONLINE_UPDATE_MODE:-epoch}"
   --online_init_steps "${INIT_STEPS:-5000}"
   --online_random_steps "${RANDOM_STEPS:-5000}"
   --online_eval_freq "${EVAL_FREQ:-1000}"
