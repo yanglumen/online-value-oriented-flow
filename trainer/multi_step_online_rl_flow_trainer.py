@@ -538,6 +538,7 @@ class online_guided_flow_trainer(object):
         episode_lengths = []
         policy_counts = {0: 0, 1: 0, 2: 0}
         noise_l2_values = []
+        step_mode_replay_sync = getattr(self.argus, "online_update_mode", "epoch") == "step"
         for _ in range(rollout_steps):
             policy_action, env_action, log_prob, policy_id = self._policy_action(self.collect_obs)
             policy_counts[policy_id] = policy_counts.get(policy_id, 0) + 1
@@ -562,12 +563,16 @@ class online_guided_flow_trainer(object):
             self.current_path["terminals"].append(np.asarray([bool(terminated)], dtype=bool))
             self.collect_obs = next_obs
             self.env_step += 1
+            path = {key: np.asarray(val) for key, val in self.current_path.items()}
+
+            if step_mode_replay_sync:
+                self.dataset.store_or_update_in_progress_trajectory(path, episode_done=episode_done)
 
             if episode_done:
-                path = {key: np.asarray(val) for key, val in self.current_path.items()}
                 ep_return = float(np.sum(path["rewards"]))
                 ep_length = int(len(path["rewards"]))
-                self.dataset.store_trajectories([path])
+                if not step_mode_replay_sync:
+                    self.dataset.store_trajectories([path])
                 self._maybe_update_normalizer()
                 episode_returns.append(ep_return)
                 episode_lengths.append(ep_length)
@@ -640,7 +645,7 @@ class online_guided_flow_trainer(object):
                 and self.step % critic_update_interval == 0
             )
         )
-        update_adv_policy = adv_policy_step_available and update_adv_critic
+        update_adv_policy = adv_policy_step_available
         if update_energy and self.argus.rl_mode == RLTrainMode.adv_rl:
             update_energy = update_adv_critic
         loss = {}

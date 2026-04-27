@@ -332,6 +332,52 @@ class OnlineReturnReplayBuffer(ReplayBuffer):
         if self._count == 1:
             self._check_attributes()
 
+    def _compute_path_returns(self, path):
+        path_length = len(path['observations'])
+        path_discounted_returns, path_undiscounted_returns = [], []
+        for start_i in range(path_length):
+            rewards = path["rewards"][start_i:]
+            discounted_returns = (self.discounts[:len(rewards)] * np.squeeze(rewards)).sum()
+            undiscounted_returns = rewards.sum()
+            path_discounted_returns.append(discounted_returns)
+            path_undiscounted_returns.append(undiscounted_returns)
+        return (
+            np.reshape(np.array(path_discounted_returns), [-1, 1]),
+            np.reshape(np.array(path_undiscounted_returns), [-1, 1]),
+        )
+
+    def _refresh_return_extrema(self):
+        if len(self._dict['discounted_returns']) == 0:
+            self.max_return, self.min_return = -9999999, 9999999
+            return
+        discounted_returns = np.vstack(self._dict['discounted_returns'])
+        self.max_return = float(np.max(discounted_returns))
+        self.min_return = float(np.min(discounted_returns))
+
+    def replace_path(self, path_ind, path):
+        path_length = len(path['observations'])
+        if path['terminals'].any():
+            assert (path['terminals'][-1] == True) and (not path['terminals'][:-1].any())
+        self._add_keys(path)
+        self._add_value_for_key()
+
+        for key in self.keys:
+            array = atleast_2d(path[key])
+            self._dict[key][path_ind] = array
+
+        try:
+            if path['terminals'].any() and self.termination_penalty is not None:
+                assert not path['timeouts'].any(), 'Penalized a timeout episode for early termination'
+                self._dict['rewards'][path_ind][-1] += self.termination_penalty
+        except:
+            pass
+
+        self._dict['path_lengths'][path_ind] = path_length
+        discounted_returns, undiscounted_returns = self._compute_path_returns(path)
+        self._dict['discounted_returns'][path_ind] = discounted_returns
+        self._dict['episode_returns'][path_ind] = undiscounted_returns
+        self._refresh_return_extrema()
+
     def __repr__(self):
         return '[ datasets_process/buffer ] Info:\n' + '\n'.join(
             f'    {key}: [{np.sum(self.path_lengths)}, (None, None)] because of initial buffer setting'

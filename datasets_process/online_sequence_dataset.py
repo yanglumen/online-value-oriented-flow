@@ -46,6 +46,7 @@ class OnlineSequenceDataset():
         self.path_lengths = self.replay_buffer.path_lengths
         self.max_path_length = self.env.max_episode_steps
         self.discounts = self.discount ** np.arange(self.max_path_length)[:, None]
+        self._in_progress_episode_index = None
         self.replay_buffer.finalize()
         print(self.replay_buffer)
 
@@ -75,6 +76,18 @@ class OnlineSequenceDataset():
         if self.argus.preserve_ep > 0:
             if len(self.replay_buffer._dict['path_lengths']) > self.argus.preserve_ep:
                 self._trim_replay_buffer_to_recent_episodes(self.argus.preserve_ep)
+        self.n_episodes = self.replay_buffer.n_episodes
+
+    def store_or_update_in_progress_trajectory(self, trajectory, episode_done=False):
+        if self._in_progress_episode_index is None:
+            self.store_trajectories([trajectory])
+            self._in_progress_episode_index = self.replay_buffer.n_episodes - 1
+        else:
+            self.replay_buffer.replace_path(self._in_progress_episode_index, trajectory)
+            self._rebuild_indices()
+        if episode_done:
+            self._in_progress_episode_index = None
+        self.n_episodes = self.replay_buffer.n_episodes
 
     def assign_normalizer_parameters(self):
         self.normalizer.calculate_normalize_parameters(self.replay_buffer)
